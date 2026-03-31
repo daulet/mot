@@ -26,6 +26,12 @@ cargo run -- --global
 
 # JSON output
 cargo run -- --json
+
+# Last 7 days only
+cargo run -- --window 7d
+
+# Alias for --window
+cargo run -- --since 1m
 ```
 
 ## CLI flags
@@ -34,6 +40,7 @@ cargo run -- --json
 - `--root <PATH>`: scope to a specific project path (default: current directory)
 - `--json`: emit machine-readable JSON
 - `--no-parallel`: disable parallel file parsing
+- `--window <DURATION>` / `--since <DURATION>`: trailing time window (`1d`, `7d`, `1m`, `1y`, etc.)
 
 ## Pricing estimation
 
@@ -63,3 +70,4 @@ Text output includes a separate row per model used.
 - Codex model attribution is read from `turn_context.payload.model`.
 - Claude usage is read from assistant `message.usage`; repeated streamed events are deduped by request/message id.
 - Claude model attribution is read from `message.model`.
+- If `--window/--since` is set, only records with timestamps inside that window are counted.

@@ -130,6 +130,7 @@ fn bench_collect_usage(c: &mut Criterion) {
             codex_root: fixture.codex_root.clone(),
             claude_root: fixture.claude_root.clone(),
             parallel,
+            window: None,
         };
 
         let global = ScanOptions {
@@ -138,6 +139,7 @@ fn bench_collect_usage(c: &mut Criterion) {
             codex_root: fixture.codex_root.clone(),
             claude_root: fixture.claude_root.clone(),
             parallel,
+            window: None,
         };
 
         group.bench_with_input(

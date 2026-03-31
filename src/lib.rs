@@ -6,7 +6,9 @@ use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use walkdir::WalkDir;
 
 const UNKNOWN_MODEL: &str = "<unknown>";
@@ -169,6 +171,8 @@ impl std::ops::Add for ProviderReport {
 pub struct ScopeReport {
     pub mode: &'static str,
     pub root: Option<PathBuf>,
+    pub window: Option<String>,
+    pub cutoff_unix_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +195,13 @@ pub struct ScanOptions {
     pub codex_root: PathBuf,
     pub claude_root: PathBuf,
     pub parallel: bool,
+    pub window: Option<TimeWindow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimeWindow {
+    pub spec: String,
+    pub cutoff_unix_ms: i64,
 }
 
 impl Default for ScanOptions {
@@ -206,7 +217,90 @@ impl Default for ScanOptions {
             codex_root: home.join(".codex").join("sessions"),
             claude_root: home.join(".claude").join("projects"),
             parallel: true,
+            window: None,
         }
+    }
+}
+
+pub fn parse_time_window(spec: &str) -> Result<TimeWindow, String> {
+    parse_time_window_at(spec, now_unix_ms())
+}
+
+fn parse_time_window_at(spec: &str, now_unix_ms: i64) -> Result<TimeWindow, String> {
+    let compact = normalize_window_spec(spec);
+    if compact.is_empty() {
+        return Err("time window is empty (examples: 1d, 7d, 1m, 1y)".to_string());
+    }
+
+    let split_at = compact
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(|| "time window must end with a unit (examples: 1d, 7d, 1m, 1y)".to_string())?;
+
+    if split_at == 0 {
+        return Err("time window must start with a positive integer".to_string());
+    }
+
+    let (value_str, unit) = compact.split_at(split_at);
+    let value = value_str
+        .parse::<u64>()
+        .map_err(|_| format!("invalid time window value: {value_str}"))?;
+    if value == 0 {
+        return Err("time window value must be greater than zero".to_string());
+    }
+
+    let seconds = match unit {
+        "s" | "sec" | "secs" | "second" | "seconds" => value,
+        "min" | "mins" | "minute" | "minutes" => value
+            .checked_mul(60)
+            .ok_or_else(|| "time window too large".to_string())?,
+        "h" | "hr" | "hrs" | "hour" | "hours" => value
+            .checked_mul(60 * 60)
+            .ok_or_else(|| "time window too large".to_string())?,
+        "d" | "day" | "days" => value
+            .checked_mul(24 * 60 * 60)
+            .ok_or_else(|| "time window too large".to_string())?,
+        "w" | "wk" | "wks" | "week" | "weeks" => value
+            .checked_mul(7 * 24 * 60 * 60)
+            .ok_or_else(|| "time window too large".to_string())?,
+        "m" | "mo" | "mon" | "month" | "months" => value
+            .checked_mul(30 * 24 * 60 * 60)
+            .ok_or_else(|| "time window too large".to_string())?,
+        "y" | "yr" | "yrs" | "year" | "years" => value
+            .checked_mul(365 * 24 * 60 * 60)
+            .ok_or_else(|| "time window too large".to_string())?,
+        _ => {
+            return Err(format!(
+                "unsupported time window unit: {unit} (use s|min|h|d|w|m|y)"
+            ));
+        }
+    };
+
+    let duration_ms = seconds
+        .checked_mul(1_000)
+        .and_then(|ms| i64::try_from(ms).ok())
+        .ok_or_else(|| "time window too large".to_string())?;
+    let cutoff_unix_ms = now_unix_ms.saturating_sub(duration_ms);
+
+    Ok(TimeWindow {
+        spec: compact,
+        cutoff_unix_ms,
+    })
+}
+
+fn normalize_window_spec(spec: &str) -> String {
+    let mut out = String::with_capacity(spec.len());
+    for ch in spec.chars() {
+        if !ch.is_whitespace() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+fn now_unix_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
     }
 }
 
@@ -261,6 +355,8 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
             } else {
                 Some(options.root.clone())
             },
+            window: options.window.as_ref().map(|window| window.spec.clone()),
+            cutoff_unix_ms: options.window.as_ref().map(|window| window.cutoff_unix_ms),
         },
         total,
         codex,
@@ -280,6 +376,9 @@ pub fn render_report(report: &UsageReport) -> String {
             out.push_str(&format!("Scope: {}\n", root.display()));
         }
         None => out.push_str("Scope: global\n"),
+    }
+    if let Some(window) = &report.scope.window {
+        out.push_str(&format!("Window: last {window}\n"));
     }
 
     out.push_str(&format!(
@@ -682,6 +781,24 @@ fn model_rule_matches(model: &str, pattern: &str) -> bool {
         .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('@'))
 }
 
+fn timestamp_in_window(timestamp: Option<&str>, window: Option<&TimeWindow>) -> bool {
+    let Some(window) = window else {
+        return true;
+    };
+    let Some(timestamp) = timestamp else {
+        return false;
+    };
+    parse_rfc3339_unix_ms(timestamp)
+        .map(|unix_ms| unix_ms >= window.cutoff_unix_ms)
+        .unwrap_or(false)
+}
+
+fn parse_rfc3339_unix_ms(timestamp: &str) -> Option<i64> {
+    let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
+    let unix_ms = parsed.unix_timestamp_nanos() / 1_000_000;
+    i64::try_from(unix_ms).ok()
+}
+
 fn discover_jsonl_files(root: &Path) -> Vec<PathBuf> {
     if !root.exists() {
         return Vec::new();
@@ -812,6 +929,12 @@ fn scan_codex_file(path: &Path, options: &ScanOptions) -> ProviderReport {
                                 if delta.is_zero() {
                                     continue;
                                 }
+                                if !timestamp_in_window(
+                                    parsed.timestamp.as_deref(),
+                                    options.window.as_ref(),
+                                ) {
+                                    continue;
+                                }
 
                                 session_totals += delta;
                                 let model = current_model
@@ -901,6 +1024,12 @@ fn scan_claude_file(path: &Path, options: &ScanOptions) -> ProviderReport {
                             if !path_in_scope(Path::new(cwd), &options.root) {
                                 continue;
                             }
+                        }
+                        if !timestamp_in_window(
+                            parsed.timestamp.as_deref(),
+                            options.window.as_ref(),
+                        ) {
+                            continue;
                         }
 
                         let (message_id, model, usage) = parsed
@@ -1004,6 +1133,8 @@ struct CodexTokenCountLine {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
+    timestamp: Option<String>,
+    #[serde(default)]
     payload: Option<CodexTokenCountPayload>,
 }
 
@@ -1047,6 +1178,8 @@ impl From<CodexTotalTokenUsage> for TokenTotals {
 struct ClaudeUsageLine {
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(rename = "requestId")]
@@ -1165,6 +1298,7 @@ mod tests {
             codex_root: codex_root.clone(),
             claude_root: temp.path().join("missing"),
             parallel: false,
+            window: None,
         };
 
         let report = collect_usage(&options);
@@ -1198,6 +1332,7 @@ mod tests {
             codex_root: temp.path().join("missing"),
             claude_root: temp.path().join("claude/projects"),
             parallel: false,
+            window: None,
         };
 
         let report = collect_usage(&options);
@@ -1242,6 +1377,7 @@ mod tests {
             codex_root,
             claude_root: temp.path().join("claude/projects"),
             parallel: false,
+            window: None,
         };
 
         let report = collect_usage(&options);
@@ -1259,6 +1395,76 @@ mod tests {
         assert!(rendered.contains("By model:"));
         assert!(rendered.contains("gpt-5.2-codex"));
         assert!(rendered.contains("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn parse_time_window_supports_common_units() {
+        let now = 1_800_000_000_000i64;
+
+        let day = parse_time_window_at("1d", now).expect("parse 1d");
+        assert_eq!(day.cutoff_unix_ms, now - 86_400_000);
+
+        let week = parse_time_window_at("7d", now).expect("parse 7d");
+        assert_eq!(week.cutoff_unix_ms, now - 7 * 86_400_000);
+
+        let month = parse_time_window_at("1m", now).expect("parse 1m");
+        assert_eq!(month.cutoff_unix_ms, now - 30 * 86_400_000);
+
+        let year = parse_time_window_at("1y", now).expect("parse 1y");
+        assert_eq!(year.cutoff_unix_ms, now - 365 * 86_400_000);
+    }
+
+    #[test]
+    fn window_filters_records_by_timestamp() {
+        let temp = tempdir().expect("create tempdir");
+
+        let codex_root = temp.path().join("codex");
+        fs::create_dir_all(&codex_root).expect("create codex root");
+        fs::write(
+            codex_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/tmp/proj\",\"model\":\"gpt-5.2-codex\"}}\n",
+                "{\"timestamp\":\"2026-03-01T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":10,\"output_tokens\":10,\"reasoning_output_tokens\":2}}}}\n",
+                "{\"timestamp\":\"2026-03-20T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":150,\"cached_input_tokens\":20,\"output_tokens\":20,\"reasoning_output_tokens\":4}}}}\n"
+            ),
+        )
+        .expect("write codex session");
+
+        let claude_root = temp.path().join("claude/projects/test");
+        fs::create_dir_all(&claude_root).expect("create claude root");
+        fs::write(
+            claude_root.join("session.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-03-02T00:00:00Z\",\"type\":\"assistant\",\"cwd\":\"/tmp/proj\",\"requestId\":\"req-old\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"m-old\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":2}}}\n",
+                "{\"timestamp\":\"2026-03-21T00:00:00Z\",\"type\":\"assistant\",\"cwd\":\"/tmp/proj\",\"requestId\":\"req-new\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"m-new\",\"usage\":{\"input_tokens\":30,\"output_tokens\":6,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":1}}}\n"
+            ),
+        )
+        .expect("write claude session");
+
+        let cutoff_unix_ms = parse_rfc3339_unix_ms("2026-03-15T00:00:00Z").expect("parse cutoff");
+        let options = ScanOptions {
+            global: true,
+            root: PathBuf::from("/tmp/proj"),
+            codex_root,
+            claude_root: temp.path().join("claude/projects"),
+            parallel: false,
+            window: Some(TimeWindow {
+                spec: "7d".to_string(),
+                cutoff_unix_ms,
+            }),
+        };
+
+        let report = collect_usage(&options);
+        assert_eq!(report.codex.totals.input, 50);
+        assert_eq!(report.codex.totals.output, 10);
+        assert_eq!(report.codex.totals.cache_read, 10);
+        assert_eq!(report.claude.totals.input, 30);
+        assert_eq!(report.claude.totals.output, 6);
+        assert_eq!(report.claude.totals.cache_read, 3);
+        assert_eq!(report.claude.totals.cache_write, 1);
+        assert_eq!(report.total.input, 80);
+        assert_eq!(report.total.output, 16);
     }
 
     #[test]
@@ -1283,6 +1489,7 @@ mod tests {
             codex_root,
             claude_root: temp.path().join("missing"),
             parallel: false,
+            window: None,
         };
 
         let report = collect_usage(&options);
@@ -1326,6 +1533,7 @@ mod tests {
             codex_root,
             claude_root: temp.path().join("claude/projects"),
             parallel: false,
+            window: None,
         };
 
         let report = collect_usage(&options);
