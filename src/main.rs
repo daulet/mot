@@ -5,10 +5,21 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "mot",
-    version,
+    version = env!("MOT_VERSION_STRING"),
+    disable_version_flag = true,
     about = "Fast CLI to aggregate LLM token usage from Codex and Claude Code metadata"
 )]
 struct Cli {
+    /// Print runtime version in the form <tag> or <tag>+<commit>
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::SetTrue,
+        global = true
+    )]
+    version: bool,
+
     #[arg(
         long,
         help = "Count usage globally across all discovered Codex/Claude sessions on this host"
@@ -43,8 +54,20 @@ struct Cli {
     claude_root: Option<PathBuf>,
 }
 
+fn resolve_runtime_version() -> &'static str {
+    option_env!("MOT_VERSION_STRING").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+fn cli_version_text() -> String {
+    format!("mot {}", resolve_runtime_version())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if cli.version {
+        println!("{}", cli_version_text());
+        return Ok(());
+    }
 
     let mut options = ScanOptions {
         global: cli.global,
@@ -75,4 +98,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print!("{}", render_report(&report));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn cli_version_text_includes_binary_name() {
+        assert!(super::cli_version_text().starts_with("mot "));
+    }
+
+    #[test]
+    fn short_v_flag_is_accepted_for_version() {
+        let parsed = Cli::try_parse_from(["mot", "-v"]).expect("parse -v");
+        assert!(parsed.version);
+    }
+
+    #[test]
+    fn long_version_flag_is_accepted_for_version() {
+        let parsed = Cli::try_parse_from(["mot", "--version"]).expect("parse --version");
+        assert!(parsed.version);
+    }
 }

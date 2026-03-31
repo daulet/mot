@@ -56,6 +56,9 @@ cargo run -- --window 7d
 
 # Alias for --window
 cargo run -- --since 1m
+
+# Runtime version from git tag metadata
+cargo run -- -v
 ```
 
 ## CLI flags
@@ -65,6 +68,7 @@ cargo run -- --since 1m
 - `--json`: emit machine-readable JSON
 - `--no-parallel`: disable parallel file parsing
 - `--window <DURATION>` / `--since <DURATION>`: trailing time window (`1d`, `7d`, `1m`, `1y`, etc.)
+- `-v, --version`: print runtime version resolved from git tags (`<tag>` or `<tag>+<commit>`)
 
 ## Pricing estimation
 
