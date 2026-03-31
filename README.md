@@ -15,6 +15,30 @@ Small and fast Rust CLI to aggregate LLM token usage from local Codex and Claude
 
 By default, `mot` scopes usage to your current working directory by matching session `cwd` prefixes.
 
+## Installation
+
+```bash
+# Homebrew (macOS)
+brew tap daulet/tap
+brew install mot
+
+# Or directly from tap
+brew install daulet/tap/mot
+
+# From source (latest main)
+cargo install --git https://github.com/daulet/mot
+```
+
+## Releases
+
+- Tags matching `v*` trigger automated release builds on GitHub Actions.
+- Artifacts are published to GitHub Releases for:
+  - `x86_64-unknown-linux-gnu`
+  - `aarch64-apple-darwin`
+  - `x86_64-apple-darwin`
+- Homebrew formula updates are pushed to `daulet/homebrew-tap` automatically.
+- Required secret for tap publishing: `HOMEBREW_TAP_TOKEN`.
+
 ## Usage
 
 ```bash
