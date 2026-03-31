@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -7,6 +8,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
+
+const UNKNOWN_MODEL: &str = "<unknown>";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct TokenTotals {
@@ -24,6 +27,26 @@ impl TokenTotals {
         self.thinking = self.thinking.max(other.thinking);
         self.cache_read = self.cache_read.max(other.cache_read);
         self.cache_write = self.cache_write.max(other.cache_write);
+    }
+
+    fn delta_from_cumulative(self, previous: Self) -> Self {
+        let decreased = self.input < previous.input
+            || self.output < previous.output
+            || self.thinking < previous.thinking
+            || self.cache_read < previous.cache_read
+            || self.cache_write < previous.cache_write;
+
+        if decreased {
+            return self;
+        }
+
+        Self {
+            input: self.input - previous.input,
+            output: self.output - previous.output,
+            thinking: self.thinking - previous.thinking,
+            cache_read: self.cache_read - previous.cache_read,
+            cache_write: self.cache_write - previous.cache_write,
+        }
     }
 
     fn is_zero(&self) -> bool {
@@ -55,12 +78,51 @@ impl std::ops::Add for TokenTotals {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ModelPricing {
+    pub input_per_mtok_usd: f64,
+    pub output_per_mtok_usd: f64,
+    pub cache_read_per_mtok_usd: f64,
+    pub cache_write_per_mtok_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ModelReport {
+    pub model: String,
+    pub records_counted: usize,
+    pub totals: TokenTotals,
+    pub estimated_cost_usd: Option<f64>,
+    pub pricing: Option<ModelPricing>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelUsage {
+    records_counted: usize,
+    totals: TokenTotals,
+}
+
+impl ModelUsage {
+    fn add_record(&mut self, totals: TokenTotals) {
+        self.records_counted += 1;
+        self.totals += totals;
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProviderReport {
     pub files_scanned: usize,
     pub records_counted: usize,
     pub parse_errors: usize,
     pub totals: TokenTotals,
+    pub estimated_cost_usd: f64,
+    pub priced_totals: TokenTotals,
+    pub unpriced_totals: TokenTotals,
+    pub priced_records_counted: usize,
+    pub unpriced_records_counted: usize,
+    pub unpriced_models: Vec<String>,
+    pub by_model: Vec<ModelReport>,
+    #[serde(skip)]
+    model_usage: HashMap<String, ModelUsage>,
 }
 
 impl std::ops::AddAssign for ProviderReport {
@@ -69,6 +131,27 @@ impl std::ops::AddAssign for ProviderReport {
         self.records_counted += rhs.records_counted;
         self.parse_errors += rhs.parse_errors;
         self.totals += rhs.totals;
+        self.estimated_cost_usd += rhs.estimated_cost_usd;
+        self.priced_totals += rhs.priced_totals;
+        self.unpriced_totals += rhs.unpriced_totals;
+        self.priced_records_counted += rhs.priced_records_counted;
+        self.unpriced_records_counted += rhs.unpriced_records_counted;
+
+        for model in rhs.unpriced_models {
+            if !self.unpriced_models.contains(&model) {
+                self.unpriced_models.push(model);
+            }
+        }
+
+        for (model, usage) in rhs.model_usage {
+            self.model_usage
+                .entry(model)
+                .and_modify(|existing| {
+                    existing.records_counted += usage.records_counted;
+                    existing.totals += usage.totals;
+                })
+                .or_insert(usage);
+        }
     }
 }
 
@@ -94,6 +177,10 @@ pub struct UsageReport {
     pub codex: ProviderReport,
     pub claude: ProviderReport,
     pub total: TokenTotals,
+    pub estimated_cost_usd: f64,
+    pub priced_totals: TokenTotals,
+    pub unpriced_totals: TokenTotals,
+    pub unpriced_models: Vec<String>,
     pub duration_ms: u128,
 }
 
@@ -139,7 +226,7 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
     let codex_files = discover_jsonl_files(&options.codex_root);
     let claude_files = discover_jsonl_files(&options.claude_root);
 
-    let (codex, claude) = if options.parallel {
+    let (mut codex, mut claude) = if options.parallel {
         rayon::join(
             || scan_codex_files(&codex_files, options),
             || scan_claude_files(&claude_files, options),
@@ -151,6 +238,21 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
         )
     };
 
+    finalize_provider_pricing(&mut codex);
+    finalize_provider_pricing(&mut claude);
+
+    let total = codex.totals + claude.totals;
+    let priced_totals = codex.priced_totals + claude.priced_totals;
+    let unpriced_totals = codex.unpriced_totals + claude.unpriced_totals;
+    let estimated_cost_usd = codex.estimated_cost_usd + claude.estimated_cost_usd;
+    let mut unpriced_models = codex.unpriced_models.clone();
+    for model in &claude.unpriced_models {
+        if !unpriced_models.contains(model) {
+            unpriced_models.push(model.clone());
+        }
+    }
+    unpriced_models.sort();
+
     UsageReport {
         scope: ScopeReport {
             mode: if options.global { "global" } else { "scoped" },
@@ -160,9 +262,13 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
                 Some(options.root.clone())
             },
         },
-        total: codex.totals + claude.totals,
+        total,
         codex,
         claude,
+        estimated_cost_usd,
+        priced_totals,
+        unpriced_totals,
+        unpriced_models,
         duration_ms: started.elapsed().as_millis(),
     }
 }
@@ -186,13 +292,41 @@ pub fn render_report(report: &UsageReport) -> String {
     ));
 
     out.push_str(&format!(
-        "{:<10} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
-        "Provider", "Input", "Output", "Thinking", "Cache Read", "Cache Write"
+        "{:<10} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
+        "Provider", "Input", "Output", "Thinking", "Cache Read", "Cache Write", "Est. Cost"
     ));
 
-    push_row(&mut out, "Codex", &report.codex.totals);
-    push_row(&mut out, "Claude", &report.claude.totals);
-    push_row(&mut out, "Total", &report.total);
+    push_row(
+        &mut out,
+        "Codex",
+        &report.codex.totals,
+        report.codex.estimated_cost_usd,
+    );
+    push_row(
+        &mut out,
+        "Claude",
+        &report.claude.totals,
+        report.claude.estimated_cost_usd,
+    );
+    push_row(&mut out, "Total", &report.total, report.estimated_cost_usd);
+
+    out.push_str("\nPricing mode: standard API (non-priority)\n");
+    if !report.unpriced_totals.is_zero() {
+        out.push_str(&format!(
+            "Unpriced tokens: input {}, output {}, thinking {}, cache read {}, cache write {}\n",
+            format_u64(report.unpriced_totals.input),
+            format_u64(report.unpriced_totals.output),
+            format_u64(report.unpriced_totals.thinking),
+            format_u64(report.unpriced_totals.cache_read),
+            format_u64(report.unpriced_totals.cache_write),
+        ));
+        if !report.unpriced_models.is_empty() {
+            out.push_str(&format!(
+                "Unpriced models: {}\n",
+                report.unpriced_models.join(", ")
+            ));
+        }
+    }
 
     if report.codex.parse_errors > 0 || report.claude.parse_errors > 0 {
         out.push_str(&format!(
@@ -204,15 +338,16 @@ pub fn render_report(report: &UsageReport) -> String {
     out
 }
 
-fn push_row(out: &mut String, name: &str, totals: &TokenTotals) {
+fn push_row(out: &mut String, name: &str, totals: &TokenTotals, estimated_cost_usd: f64) {
     out.push_str(&format!(
-        "{:<10} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
+        "{:<10} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
         name,
         format_u64(totals.input),
         format_u64(totals.output),
         format_u64(totals.thinking),
         format_u64(totals.cache_read),
         format_u64(totals.cache_write),
+        format_usd(estimated_cost_usd),
     ));
 }
 
@@ -221,12 +356,278 @@ fn format_u64(value: u64) -> String {
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     let len = digits.len();
     for (i, ch) in digits.chars().enumerate() {
-        if i != 0 && (len - i) % 3 == 0 {
+        if i != 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
     }
     out
+}
+
+fn format_usd(value: f64) -> String {
+    if value >= 1.0 {
+        format!("${value:.2}")
+    } else if value >= 0.01 {
+        format!("${value:.4}")
+    } else {
+        format!("${value:.6}")
+    }
+}
+
+fn finalize_provider_pricing(report: &mut ProviderReport) {
+    report.estimated_cost_usd = 0.0;
+    report.priced_totals = TokenTotals::default();
+    report.unpriced_totals = TokenTotals::default();
+    report.priced_records_counted = 0;
+    report.unpriced_records_counted = 0;
+    report.unpriced_models.clear();
+    report.by_model.clear();
+
+    let mut by_model = Vec::with_capacity(report.model_usage.len());
+
+    for (model, usage) in &report.model_usage {
+        let pricing = lookup_model_pricing(model);
+        let estimated_cost_usd = pricing.map(|rates| estimate_cost_usd(usage.totals, rates));
+
+        match estimated_cost_usd {
+            Some(cost) => {
+                report.estimated_cost_usd += cost;
+                report.priced_totals += usage.totals;
+                report.priced_records_counted += usage.records_counted;
+            }
+            None => {
+                report.unpriced_totals += usage.totals;
+                report.unpriced_records_counted += usage.records_counted;
+                if !report.unpriced_models.contains(model) {
+                    report.unpriced_models.push(model.clone());
+                }
+            }
+        }
+
+        by_model.push(ModelReport {
+            model: model.clone(),
+            records_counted: usage.records_counted,
+            totals: usage.totals,
+            estimated_cost_usd,
+            pricing,
+        });
+    }
+
+    by_model.sort_by(model_report_sort);
+    report.unpriced_models.sort();
+    report.by_model = by_model;
+}
+
+fn model_report_sort(a: &ModelReport, b: &ModelReport) -> Ordering {
+    match (a.estimated_cost_usd, b.estimated_cost_usd) {
+        (Some(left), Some(right)) => right
+            .partial_cmp(&left)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| b.totals.input.cmp(&a.totals.input))
+            .then_with(|| a.model.cmp(&b.model)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => b
+            .totals
+            .input
+            .cmp(&a.totals.input)
+            .then_with(|| a.model.cmp(&b.model)),
+    }
+}
+
+fn estimate_cost_usd(totals: TokenTotals, rates: ModelPricing) -> f64 {
+    usd_from_tokens(totals.input, rates.input_per_mtok_usd)
+        + usd_from_tokens(totals.output, rates.output_per_mtok_usd)
+        + usd_from_tokens(totals.cache_read, rates.cache_read_per_mtok_usd)
+        + usd_from_tokens(totals.cache_write, rates.cache_write_per_mtok_usd)
+}
+
+fn usd_from_tokens(tokens: u64, per_mtok_usd: f64) -> f64 {
+    (tokens as f64) * per_mtok_usd / 1_000_000.0
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PricingRule {
+    patterns: &'static [&'static str],
+    pricing: ModelPricing,
+}
+
+const fn pricing(
+    input_per_mtok_usd: f64,
+    output_per_mtok_usd: f64,
+    cache_read_per_mtok_usd: f64,
+    cache_write_per_mtok_usd: f64,
+) -> ModelPricing {
+    ModelPricing {
+        input_per_mtok_usd,
+        output_per_mtok_usd,
+        cache_read_per_mtok_usd,
+        cache_write_per_mtok_usd,
+    }
+}
+
+// API standard-rate pricing snapshots used for estimation.
+// Source date: 2026-03-30.
+// OpenAI: https://developers.openai.com/api/docs/pricing and
+// model pages under https://developers.openai.com/api/docs/models/*
+// Anthropic: https://docs.anthropic.com/en/docs/about-claude/pricing
+//
+// Anthropic cache write estimates use the default 5-minute cache write rate.
+const OPENAI_PRICING_RULES: &[PricingRule] = &[
+    PricingRule {
+        patterns: &["gpt-5.4-pro"],
+        pricing: pricing(30.0, 180.0, 0.0, 30.0),
+    },
+    PricingRule {
+        patterns: &["gpt-5.4-mini"],
+        pricing: pricing(0.75, 4.5, 0.075, 0.75),
+    },
+    PricingRule {
+        patterns: &["gpt-5.4-nano"],
+        pricing: pricing(0.20, 1.25, 0.02, 0.20),
+    },
+    PricingRule {
+        patterns: &["gpt-5.4"],
+        pricing: pricing(2.5, 15.0, 0.25, 2.5),
+    },
+    PricingRule {
+        patterns: &["gpt-5.3-codex"],
+        pricing: pricing(1.75, 14.0, 0.175, 1.75),
+    },
+    PricingRule {
+        patterns: &["gpt-5.3-chat-latest"],
+        pricing: pricing(1.75, 14.0, 0.175, 1.75),
+    },
+    PricingRule {
+        patterns: &["gpt-5.2-pro"],
+        pricing: pricing(21.0, 168.0, 0.0, 21.0),
+    },
+    PricingRule {
+        patterns: &["gpt-5.2-codex", "gpt-5.2"],
+        pricing: pricing(1.75, 14.0, 0.175, 1.75),
+    },
+    PricingRule {
+        patterns: &["gpt-5.1-codex-mini"],
+        pricing: pricing(0.25, 2.0, 0.025, 0.25),
+    },
+    PricingRule {
+        patterns: &["gpt-5.1-codex", "gpt-5.1"],
+        pricing: pricing(1.25, 10.0, 0.125, 1.25),
+    },
+    PricingRule {
+        patterns: &["gpt-5-pro"],
+        pricing: pricing(15.0, 120.0, 0.0, 15.0),
+    },
+    PricingRule {
+        patterns: &["gpt-5-codex", "gpt-5"],
+        pricing: pricing(1.25, 10.0, 0.125, 1.25),
+    },
+    PricingRule {
+        patterns: &["gpt-5-mini"],
+        pricing: pricing(0.25, 2.0, 0.025, 0.25),
+    },
+    PricingRule {
+        patterns: &["gpt-5-nano"],
+        pricing: pricing(0.05, 0.4, 0.005, 0.05),
+    },
+    PricingRule {
+        patterns: &["codex-mini-latest"],
+        pricing: pricing(1.5, 6.0, 0.375, 1.5),
+    },
+];
+
+const ANTHROPIC_PRICING_RULES: &[PricingRule] = &[
+    PricingRule {
+        patterns: &["claude-opus-4-6"],
+        pricing: pricing(5.0, 25.0, 0.5, 6.25),
+    },
+    PricingRule {
+        patterns: &["claude-opus-4-5"],
+        pricing: pricing(5.0, 25.0, 0.5, 6.25),
+    },
+    PricingRule {
+        patterns: &["claude-opus-4-1"],
+        pricing: pricing(15.0, 75.0, 1.5, 18.75),
+    },
+    PricingRule {
+        patterns: &["claude-opus-4"],
+        pricing: pricing(15.0, 75.0, 1.5, 18.75),
+    },
+    PricingRule {
+        patterns: &["claude-sonnet-4-6"],
+        pricing: pricing(3.0, 15.0, 0.3, 3.75),
+    },
+    PricingRule {
+        patterns: &["claude-sonnet-4-5"],
+        pricing: pricing(3.0, 15.0, 0.3, 3.75),
+    },
+    PricingRule {
+        patterns: &["claude-sonnet-4"],
+        pricing: pricing(3.0, 15.0, 0.3, 3.75),
+    },
+    PricingRule {
+        patterns: &["claude-3-7-sonnet", "claude-sonnet-3-7"],
+        pricing: pricing(3.0, 15.0, 0.3, 3.75),
+    },
+    PricingRule {
+        patterns: &["claude-3-5-sonnet", "claude-sonnet-3-5"],
+        pricing: pricing(3.0, 15.0, 0.3, 3.75),
+    },
+    PricingRule {
+        patterns: &["claude-haiku-4-5", "claude-4-5-haiku"],
+        pricing: pricing(1.0, 5.0, 0.1, 1.25),
+    },
+    PricingRule {
+        patterns: &["claude-3-5-haiku", "claude-haiku-3-5"],
+        pricing: pricing(0.8, 4.0, 0.08, 1.0),
+    },
+    PricingRule {
+        patterns: &["claude-opus-3", "claude-3-opus"],
+        pricing: pricing(15.0, 75.0, 1.5, 18.75),
+    },
+    PricingRule {
+        patterns: &["claude-haiku-3", "claude-3-haiku"],
+        pricing: pricing(0.25, 1.25, 0.03, 0.30),
+    },
+];
+
+fn lookup_model_pricing(model: &str) -> Option<ModelPricing> {
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == UNKNOWN_MODEL {
+        return None;
+    }
+
+    for rule in OPENAI_PRICING_RULES {
+        if rule
+            .patterns
+            .iter()
+            .any(|pattern| model_rule_matches(&normalized, pattern))
+        {
+            return Some(rule.pricing);
+        }
+    }
+
+    for rule in ANTHROPIC_PRICING_RULES {
+        if rule
+            .patterns
+            .iter()
+            .any(|pattern| model_rule_matches(&normalized, pattern))
+        {
+            return Some(rule.pricing);
+        }
+    }
+
+    None
+}
+
+fn model_rule_matches(model: &str, pattern: &str) -> bool {
+    if model == pattern {
+        return true;
+    }
+
+    model
+        .strip_prefix(pattern)
+        .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('@'))
 }
 
 fn discover_jsonl_files(root: &Path) -> Vec<PathBuf> {
@@ -295,7 +696,10 @@ fn scan_codex_file(path: &Path, options: &ScanOptions) -> ProviderReport {
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut line = String::new();
     let mut session_cwd: Option<PathBuf> = None;
-    let mut max_totals = TokenTotals::default();
+    let mut current_model: Option<String> = None;
+    let mut previous_totals = TokenTotals::default();
+    let mut session_totals = TokenTotals::default();
+    let mut by_model: HashMap<String, ModelUsage> = HashMap::new();
     let mut saw_usage = false;
 
     loop {
@@ -311,6 +715,24 @@ fn scan_codex_file(path: &Path, options: &ScanOptions) -> ProviderReport {
                                 && let Some(cwd) = payload.cwd
                             {
                                 session_cwd = Some(PathBuf::from(cwd));
+                            }
+                        }
+                        Err(_) => report.parse_errors += 1,
+                    }
+                }
+
+                if line.contains("\"type\":\"turn_context\"") {
+                    match serde_json::from_str::<CodexTurnContextLine>(&line) {
+                        Ok(parsed) => {
+                            if parsed.kind == "turn_context"
+                                && let Some(payload) = parsed.payload
+                            {
+                                if let Some(cwd) = payload.cwd {
+                                    session_cwd = Some(PathBuf::from(cwd));
+                                }
+                                if let Some(model) = payload.model {
+                                    current_model = Some(model);
+                                }
                             }
                         }
                         Err(_) => report.parse_errors += 1,
@@ -333,7 +755,24 @@ fn scan_codex_file(path: &Path, options: &ScanOptions) -> ProviderReport {
 
                             if let Some(usage) = usage {
                                 saw_usage = true;
-                                max_totals.max_assign(&usage);
+                                let delta = usage.delta_from_cumulative(previous_totals);
+                                previous_totals = usage;
+                                if delta.is_zero() {
+                                    continue;
+                                }
+
+                                session_totals += delta;
+                                let model = current_model
+                                    .as_deref()
+                                    .unwrap_or(UNKNOWN_MODEL)
+                                    .to_string();
+                                by_model
+                                    .entry(model)
+                                    .or_insert_with(|| ModelUsage {
+                                        records_counted: 1,
+                                        totals: TokenTotals::default(),
+                                    })
+                                    .totals += delta;
                             }
                         }
                         Err(_) => report.parse_errors += 1,
@@ -362,7 +801,8 @@ fn scan_codex_file(path: &Path, options: &ScanOptions) -> ProviderReport {
     }
 
     report.records_counted = 1;
-    report.totals = max_totals;
+    report.totals = session_totals;
+    report.model_usage = by_model;
     report
 }
 
@@ -382,7 +822,7 @@ fn scan_claude_file(path: &Path, options: &ScanOptions) -> ProviderReport {
 
     let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut line = String::new();
-    let mut by_request: HashMap<String, TokenTotals> = HashMap::new();
+    let mut by_request: HashMap<String, ClaudeRequestUsage> = HashMap::new();
     let mut line_no: usize = 0;
 
     loop {
@@ -411,15 +851,21 @@ fn scan_claude_file(path: &Path, options: &ScanOptions) -> ProviderReport {
                             }
                         }
 
-                        let (message_id, usage) = parsed
+                        let (message_id, model, usage) = parsed
                             .message
-                            .and_then(|message| message.usage.map(|usage| (message.id, usage)))
-                            .unwrap_or((None, ClaudeUsage::default()));
+                            .and_then(|message| {
+                                message
+                                    .usage
+                                    .map(|usage| (message.id, message.model, usage))
+                            })
+                            .unwrap_or((None, None, ClaudeUsage::default()));
 
                         let totals = usage.to_totals();
                         if totals.is_zero() {
                             continue;
                         }
+
+                        let model = model.unwrap_or_else(|| UNKNOWN_MODEL.to_string());
 
                         let key = parsed
                             .request_id
@@ -429,8 +875,13 @@ fn scan_claude_file(path: &Path, options: &ScanOptions) -> ProviderReport {
 
                         by_request
                             .entry(key)
-                            .and_modify(|existing| existing.max_assign(&totals))
-                            .or_insert(totals);
+                            .and_modify(|existing| {
+                                existing.totals.max_assign(&totals);
+                                if existing.model == UNKNOWN_MODEL && model != UNKNOWN_MODEL {
+                                    existing.model = model.clone();
+                                }
+                            })
+                            .or_insert(ClaudeRequestUsage { model, totals });
                     }
                     Err(_) => report.parse_errors += 1,
                 }
@@ -443,9 +894,19 @@ fn scan_claude_file(path: &Path, options: &ScanOptions) -> ProviderReport {
     }
 
     report.records_counted = by_request.len();
-    report.totals = by_request
-        .into_values()
-        .fold(TokenTotals::default(), |acc, item| acc + item);
+    let mut by_model: HashMap<String, ModelUsage> = HashMap::new();
+    let mut totals = TokenTotals::default();
+
+    for usage in by_request.into_values() {
+        totals += usage.totals;
+        by_model
+            .entry(usage.model)
+            .or_default()
+            .add_record(usage.totals);
+    }
+
+    report.totals = totals;
+    report.model_usage = by_model;
     report
 }
 
@@ -468,6 +929,22 @@ struct CodexSessionMetaLine {
 struct CodexSessionMetaPayload {
     #[serde(default)]
     cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTurnContextLine {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    payload: Option<CodexTurnContextPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTurnContextPayload {
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -533,7 +1010,15 @@ struct ClaudeMessage {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     usage: Option<ClaudeUsage>,
+}
+
+#[derive(Debug)]
+struct ClaudeRequestUsage {
+    model: String,
+    totals: TokenTotals,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -669,6 +1154,90 @@ mod tests {
         assert_eq!(report.claude.totals.output, 3);
         assert_eq!(report.claude.totals.cache_read, 4);
         assert_eq!(report.claude.totals.cache_write, 5);
+    }
+
+    #[test]
+    fn estimates_cost_for_known_openai_and_anthropic_models() {
+        let temp = tempdir().expect("create tempdir");
+
+        let codex_root = temp.path().join("codex");
+        fs::create_dir_all(&codex_root).expect("create codex root");
+        fs::write(
+            codex_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/tmp/proj\",\"model\":\"gpt-5.2-codex\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":30,\"output_tokens\":10,\"reasoning_output_tokens\":2}}}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":150,\"cached_input_tokens\":50,\"output_tokens\":20,\"reasoning_output_tokens\":4}}}}\n"
+            ),
+        )
+        .expect("write codex session");
+
+        let claude_root = temp.path().join("claude/projects/test");
+        fs::create_dir_all(&claude_root).expect("create claude root");
+        fs::write(
+            claude_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"assistant\",\"cwd\":\"/tmp/proj\",\"requestId\":\"req1\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":40}}}\n",
+                "{\"type\":\"assistant\",\"cwd\":\"/tmp/proj\",\"requestId\":\"req1\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":40}}}\n"
+            ),
+        )
+        .expect("write claude session");
+
+        let options = ScanOptions {
+            global: true,
+            root: PathBuf::from("/tmp/proj"),
+            codex_root,
+            claude_root: temp.path().join("claude/projects"),
+            parallel: false,
+        };
+
+        let report = collect_usage(&options);
+
+        let expected_codex = (150.0 * 1.75 + 50.0 * 0.175 + 20.0 * 14.0) / 1_000_000.0;
+        let expected_claude = (100.0 * 3.0 + 50.0 * 0.30 + 40.0 * 3.75 + 20.0 * 15.0) / 1_000_000.0;
+        let expected_total = expected_codex + expected_claude;
+
+        assert!((report.codex.estimated_cost_usd - expected_codex).abs() < 1e-12);
+        assert!((report.claude.estimated_cost_usd - expected_claude).abs() < 1e-12);
+        assert!((report.estimated_cost_usd - expected_total).abs() < 1e-12);
+        assert!(report.unpriced_totals.is_zero());
+    }
+
+    #[test]
+    fn unknown_models_are_tracked_as_unpriced() {
+        let temp = tempdir().expect("create tempdir");
+        let codex_root = temp.path().join("codex");
+        fs::create_dir_all(&codex_root).expect("create codex root");
+
+        fs::write(
+            codex_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/tmp/proj\",\"model\":\"mystery-model\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":3,\"output_tokens\":2,\"reasoning_output_tokens\":1}}}}\n"
+            ),
+        )
+        .expect("write codex session");
+
+        let options = ScanOptions {
+            global: true,
+            root: PathBuf::from("/tmp/proj"),
+            codex_root,
+            claude_root: temp.path().join("missing"),
+            parallel: false,
+        };
+
+        let report = collect_usage(&options);
+        assert_eq!(report.estimated_cost_usd, 0.0);
+        assert_eq!(report.unpriced_totals.input, 10);
+        assert_eq!(report.unpriced_totals.cache_read, 3);
+        assert_eq!(report.unpriced_totals.output, 2);
+        assert!(
+            report
+                .unpriced_models
+                .contains(&"mystery-model".to_string())
+        );
     }
 
     #[test]
