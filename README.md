@@ -38,6 +38,7 @@ cargo run -- --json
 ## Pricing estimation
 
 `mot` estimates cost per model, then aggregates by provider and total.
+Text output includes a separate row per model used.
 
 - OpenAI rates are matched by model id (including snapshots/suffixes) for:
   - GPT-5.4 family (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.4-pro`)

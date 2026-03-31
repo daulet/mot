@@ -310,6 +310,28 @@ pub fn render_report(report: &UsageReport) -> String {
     );
     push_row(&mut out, "Total", &report.total, report.estimated_cost_usd);
 
+    if !report.codex.by_model.is_empty() || !report.claude.by_model.is_empty() {
+        out.push_str("\nBy model:\n");
+        out.push_str(&format!(
+            "{:<10} {:<28} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
+            "Provider",
+            "Model",
+            "Input",
+            "Output",
+            "Thinking",
+            "Cache Read",
+            "Cache Write",
+            "Est. Cost"
+        ));
+
+        for model in &report.codex.by_model {
+            push_model_row(&mut out, "Codex", model);
+        }
+        for model in &report.claude.by_model {
+            push_model_row(&mut out, "Claude", model);
+        }
+    }
+
     out.push_str("\nPricing mode: standard API (non-priority)\n");
     if !report.unpriced_totals.is_zero() {
         out.push_str(&format!(
@@ -349,6 +371,36 @@ fn push_row(out: &mut String, name: &str, totals: &TokenTotals, estimated_cost_u
         format_u64(totals.cache_write),
         format_usd(estimated_cost_usd),
     ));
+}
+
+fn push_model_row(out: &mut String, provider: &str, model: &ModelReport) {
+    out.push_str(&format!(
+        "{:<10} {:<28} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
+        provider,
+        truncate_model_name(&model.model, 28),
+        format_u64(model.totals.input),
+        format_u64(model.totals.output),
+        format_u64(model.totals.thinking),
+        format_u64(model.totals.cache_read),
+        format_u64(model.totals.cache_write),
+        format_optional_usd(model.estimated_cost_usd),
+    ));
+}
+
+fn truncate_model_name(model: &str, max_len: usize) -> String {
+    if model.chars().count() <= max_len {
+        return model.to_string();
+    }
+
+    let keep = max_len.saturating_sub(3);
+    let mut out = String::with_capacity(max_len);
+    out.extend(model.chars().take(keep));
+    out.push_str("...");
+    out
+}
+
+fn format_optional_usd(value: Option<f64>) -> String {
+    value.map(format_usd).unwrap_or_else(|| "n/a".to_string())
 }
 
 fn format_u64(value: u64) -> String {
@@ -1202,6 +1254,11 @@ mod tests {
         assert!((report.claude.estimated_cost_usd - expected_claude).abs() < 1e-12);
         assert!((report.estimated_cost_usd - expected_total).abs() < 1e-12);
         assert!(report.unpriced_totals.is_zero());
+
+        let rendered = render_report(&report);
+        assert!(rendered.contains("By model:"));
+        assert!(rendered.contains("gpt-5.2-codex"));
+        assert!(rendered.contains("claude-sonnet-4-5-20250929"));
     }
 
     #[test]
