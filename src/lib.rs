@@ -1867,10 +1867,10 @@ fn summarize_droid_jsonl(
                 if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
                     started_at.get_or_insert_with(|| timestamp.to_string());
                 }
-                if value.get("type").and_then(Value::as_str) == Some("session_start") {
-                    if let Some(line_cwd) = value.get("cwd").and_then(Value::as_str) {
-                        cwd = Some(PathBuf::from(line_cwd));
-                    }
+                if value.get("type").and_then(Value::as_str) == Some("session_start")
+                    && let Some(line_cwd) = value.get("cwd").and_then(Value::as_str)
+                {
+                    cwd = Some(PathBuf::from(line_cwd));
                 }
                 let role = value
                     .get("role")

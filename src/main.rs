@@ -413,12 +413,17 @@ fn build_session_picker_frame(
     lines.push(fit_terminal_line(&session_picker_header(), line_width));
 
     let selected_line = 3 + selected.saturating_sub(offset);
-    for idx in offset..(offset + visible_rows) {
+    for (idx, session) in sessions
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_rows)
+    {
         let prefix = if idx == selected { ">" } else { " " };
         lines.push(fit_terminal_line(
             &format!(
                 "{prefix} {}",
-                format_session_menu_row(idx + 1, &sessions[idx])
+                format_session_menu_row(idx + 1, session)
             ),
             line_width,
         ));
