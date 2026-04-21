@@ -2618,9 +2618,17 @@ struct CodexTotalTokenUsage {
 
 impl From<CodexTotalTokenUsage> for TokenTotals {
     fn from(value: CodexTotalTokenUsage) -> Self {
+        // OpenAI usage reports `input_tokens` inclusive of cached tokens.
+        // Normalize to non-cached input so cache reads are not double counted.
+        let uncached_input_tokens = value.input_tokens.saturating_sub(value.cached_input_tokens);
+        // OpenAI reasoning tokens are billed as output tokens and are included
+        // in `output_tokens`; split out non-thinking output to avoid double counting.
+        let visible_output_tokens = value
+            .output_tokens
+            .saturating_sub(value.reasoning_output_tokens);
         Self {
-            input: value.input_tokens,
-            output: value.output_tokens,
+            input: uncached_input_tokens,
+            output: visible_output_tokens,
             thinking: value.reasoning_output_tokens,
             cache_read: value.cached_input_tokens,
             cache_write: 0,
@@ -2712,10 +2720,13 @@ impl ClaudeUsage {
                     .map(|thinking| thinking.tokens.max(thinking.output_tokens))
                     .unwrap_or(0),
             );
+        // Anthropic thinking tokens are billed as output tokens; normalize output
+        // to non-thinking tokens so output + thinking is additive.
+        let visible_output_tokens = self.output_tokens.saturating_sub(thinking);
 
         TokenTotals {
             input: self.input_tokens,
-            output: self.output_tokens,
+            output: visible_output_tokens,
             thinking,
             cache_read: self.cache_read_input_tokens,
             cache_write: self.cache_creation_input_tokens,
@@ -2966,9 +2977,9 @@ mod tests {
 
         let report = collect_usage(&options);
         assert_eq!(report.codex.records_counted, 1);
-        assert_eq!(report.codex.totals.input, 25);
+        assert_eq!(report.codex.totals.input, 20);
         assert_eq!(report.codex.totals.cache_read, 5);
-        assert_eq!(report.codex.totals.output, 7);
+        assert_eq!(report.codex.totals.output, 5);
         assert_eq!(report.codex.totals.thinking, 2);
     }
 
@@ -3051,7 +3062,7 @@ mod tests {
 
         let report = collect_usage(&options);
 
-        let expected_codex = (150.0 * 1.75 + 50.0 * 0.175 + 20.0 * 14.0 + 4.0 * 14.0) / 1_000_000.0;
+        let expected_codex = (100.0 * 1.75 + 50.0 * 0.175 + 16.0 * 14.0 + 4.0 * 14.0) / 1_000_000.0;
         let expected_claude = (100.0 * 3.0 + 50.0 * 0.30 + 40.0 * 3.75 + 20.0 * 15.0) / 1_000_000.0;
         let expected_total = expected_codex + expected_claude;
 
@@ -3130,15 +3141,15 @@ mod tests {
         };
 
         let report = collect_usage(&options);
-        assert_eq!(report.codex.totals.input, 50);
-        assert_eq!(report.codex.totals.output, 10);
+        assert_eq!(report.codex.totals.input, 40);
+        assert_eq!(report.codex.totals.output, 8);
         assert_eq!(report.codex.totals.cache_read, 10);
         assert_eq!(report.claude.totals.input, 30);
         assert_eq!(report.claude.totals.output, 6);
         assert_eq!(report.claude.totals.cache_read, 3);
         assert_eq!(report.claude.totals.cache_write, 1);
-        assert_eq!(report.total.input, 80);
-        assert_eq!(report.total.output, 16);
+        assert_eq!(report.total.input, 70);
+        assert_eq!(report.total.output, 14);
     }
 
     #[test]
@@ -3187,10 +3198,10 @@ mod tests {
         let snapshot = build_topbar_snapshot_for_day_keys(&report, &day_keys);
 
         assert_eq!(snapshot.days.len(), 3);
-        assert_eq!(snapshot.days[0].total_tokens, 117);
+        assert_eq!(snapshot.days[0].total_tokens, 105);
         assert_eq!(snapshot.days[1].total_tokens, 121);
         assert_eq!(snapshot.days[2].total_tokens, 0);
-        assert_eq!(snapshot.total_tokens, 238);
+        assert_eq!(snapshot.total_tokens, 226);
     }
 
     #[test]
@@ -3223,9 +3234,9 @@ mod tests {
 
         let report = collect_usage(&options);
         assert_eq!(report.estimated_cost_usd, 0.0);
-        assert_eq!(report.unpriced_totals.input, 10);
+        assert_eq!(report.unpriced_totals.input, 7);
         assert_eq!(report.unpriced_totals.cache_read, 3);
-        assert_eq!(report.unpriced_totals.output, 2);
+        assert_eq!(report.unpriced_totals.output, 1);
         assert!(
             report
                 .unpriced_models
