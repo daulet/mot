@@ -36,8 +36,9 @@ Claude     claude-opus-4-6                           4            477           
 
 When stdout is an interactive terminal, table output also renders a GitHub-style
 Ratatui activity calendar for the last 53 weeks. Squares are shaded by daily
-token activity. Activity days come from the same timestamped usage records as
-the daily rollups:
+token activity. Activity days and peak hour are bucketed with the current local
+timezone offset of the `mot` process. Activity days come from the same
+timestamped usage records as the daily rollups:
 
 - Codex: token-count event deltas are assigned to each event timestamp, so a
   session that spans multiple days contributes to each active day.
@@ -75,5 +76,6 @@ Notes:
 
 - Remote scanning reads the same default directories as local mode: `~/.codex/sessions` and `~/.claude/projects`.
 - It shells out to local `ssh` and runs `mot --json` on the remote host, so `mot` must be installed remotely and available in `PATH`.
+- Remote activity stats are requested with the caller's local timezone offset so calendar days, streaks, and peak hour use one shared boundary before reports are merged.
 - If a remote host has an older/incompatible `mot` (or missing `mot`), that host is skipped and surfaced in `Warnings` output.
 - For cross-host aggregation, `--global` is usually the right choice because scoped mode still filters by the recorded session `cwd`.

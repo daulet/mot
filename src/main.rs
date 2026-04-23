@@ -153,6 +153,9 @@ struct Cli {
 
     #[arg(long, value_name = "PATH", hide = true)]
     claude_root: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    activity_timezone_offset_seconds: Option<i32>,
 }
 
 fn resolve_runtime_version() -> &'static str {
@@ -200,6 +203,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(claude_root) = cli.claude_root {
         options.claude_root = claude_root;
+    }
+    if let Some(offset_seconds) = cli.activity_timezone_offset_seconds {
+        options.activity_timezone_offset_seconds = offset_seconds;
     }
 
     if (cli.session.is_some() || cli.select_session) && has_ssh_hosts {
@@ -267,7 +273,11 @@ fn activity_calendar_lines(
 ) -> Vec<Line<'static>> {
     let weeks = activity_calendar_visible_weeks(width);
     let gap = activity_calendar_has_gap(width, weeks);
-    let today = OffsetDateTime::now_utc().date();
+    let today = snapshot
+        .days
+        .last()
+        .and_then(|day| date_from_day_key(&day.day))
+        .unwrap_or_else(|| OffsetDateTime::now_utc().date());
     let start = activity_calendar_start_date(today, weeks);
     let day_totals = activity_day_totals(snapshot);
     let (active_days, total_days, _total_tokens, max_tokens) =
@@ -1536,6 +1546,67 @@ mod tests {
     }
 
     #[test]
+    fn activity_calendar_lines_use_snapshot_day_as_today() {
+        let snapshot = mot::TopBarSnapshot {
+            scope: mot::ScopeReport {
+                mode: "global",
+                root: None,
+                window: None,
+                cutoff_unix_ms: None,
+                session: None,
+            },
+            activity_timezone_offset_seconds: -7 * 60 * 60,
+            days: vec![
+                mot::TopBarDay {
+                    day: "2026-03-19".to_string(),
+                    total: TokenTotals {
+                        input: 10,
+                        ..TokenTotals::default()
+                    },
+                    total_tokens: 10,
+                    estimated_cost_usd: 0.0,
+                },
+                mot::TopBarDay {
+                    day: "2026-03-20".to_string(),
+                    total: TokenTotals {
+                        input: 20,
+                        ..TokenTotals::default()
+                    },
+                    total_tokens: 20,
+                    estimated_cost_usd: 0.0,
+                },
+            ],
+            total: TokenTotals {
+                input: 30,
+                ..TokenTotals::default()
+            },
+            total_tokens: 30,
+            estimated_cost_usd: 0.0,
+        };
+        let lines = super::activity_calendar_lines(
+            &snapshot,
+            120,
+            super::ActivityReportStats {
+                total_sessions: 0,
+                favorite_model: None,
+                largest_session_tokens: None,
+                longest_session_duration_seconds: None,
+                peak_hour: None,
+            },
+        );
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Current streak:"));
+        assert!(text.contains("2 days"));
+        assert!(text.contains("Active days:"));
+        assert!(text.contains("2/2"));
+    }
+
+    #[test]
     fn activity_book_scale_line_formats_ratio_under_stats() {
         assert_eq!(super::estimated_tokens_for_words(75), 100);
 
@@ -1727,6 +1798,7 @@ mod tests {
                 cutoff_unix_ms: None,
                 session: None,
             },
+            activity_timezone_offset_seconds: 0,
             codex: mot::ProviderReport::default(),
             claude: mot::ProviderReport::default(),
             by_host: Vec::new(),

@@ -129,11 +129,11 @@ fn bench_collect_usage(c: &mut Criterion) {
             root: fixture.scoped_root.clone(),
             codex_root: fixture.codex_root.clone(),
             claude_root: fixture.claude_root.clone(),
-            droid_root: fixture.scoped_root.join("missing"),
             parallel,
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let global = ScanOptions {
@@ -141,11 +141,11 @@ fn bench_collect_usage(c: &mut Criterion) {
             root: fixture.scoped_root.clone(),
             codex_root: fixture.codex_root.clone(),
             claude_root: fixture.claude_root.clone(),
-            droid_root: fixture.scoped_root.join("missing"),
             parallel,
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         group.bench_with_input(

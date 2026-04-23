@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
-use time::{Date, Duration, OffsetDateTime};
+use time::{Date, Duration, OffsetDateTime, UtcOffset};
 use walkdir::WalkDir;
 
 const UNKNOWN_MODEL: &str = "<unknown>";
@@ -338,6 +338,7 @@ pub struct ScopeReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageReport {
     pub scope: ScopeReport,
+    pub activity_timezone_offset_seconds: i32,
     pub codex: ProviderReport,
     pub claude: ProviderReport,
     pub by_host: Vec<HostReport>,
@@ -360,6 +361,7 @@ struct RemoteUsageReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct TopBarSnapshot {
     pub scope: ScopeReport,
+    pub activity_timezone_offset_seconds: i32,
     pub days: Vec<TopBarDay>,
     pub total: TokenTotals,
     pub total_tokens: u64,
@@ -384,6 +386,7 @@ pub struct ScanOptions {
     pub window: Option<TimeWindow>,
     pub ssh_hosts: Vec<String>,
     pub selected_session: Option<SessionSummary>,
+    pub activity_timezone_offset_seconds: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -408,6 +411,7 @@ impl Default for ScanOptions {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: local_timezone_offset_seconds(),
         }
     }
 }
@@ -556,6 +560,7 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
             cutoff_unix_ms: options.window.as_ref().map(|window| window.cutoff_unix_ms),
             session: options.selected_session.clone(),
         },
+        activity_timezone_offset_seconds: options.activity_timezone_offset_seconds,
         total: TokenTotals::default(),
         codex,
         claude,
@@ -574,7 +579,7 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
 }
 
 pub fn build_topbar_snapshot(report: &UsageReport, days: usize) -> TopBarSnapshot {
-    let day_keys = recent_day_keys(days);
+    let day_keys = recent_day_keys(days, report.activity_timezone_offset_seconds);
     build_topbar_snapshot_for_day_keys(report, &day_keys)
 }
 
@@ -1028,17 +1033,23 @@ fn merge_remote_host_reports(report: &mut UsageReport, options: &ScanOptions) {
 
     for (host, result) in remote_reports {
         match result {
-            Ok(mut remote) => {
-                collapse_provider_to_host(&mut remote.codex, &host);
-                collapse_provider_to_host(&mut remote.claude, &host);
-                merge_provider_report(&mut report.codex, remote.codex);
-                merge_provider_report(&mut report.claude, remote.claude);
-            }
+            Ok(remote) => merge_remote_usage_report_for_host(report, &host, remote),
             Err(warning) => {
                 report.codex.warnings.push(warning);
             }
         }
     }
+}
+
+fn merge_remote_usage_report_for_host(
+    report: &mut UsageReport,
+    host: &str,
+    mut remote: RemoteUsageReport,
+) {
+    collapse_provider_to_host(&mut remote.codex, host);
+    collapse_provider_to_host(&mut remote.claude, host);
+    merge_provider_report(&mut report.codex, remote.codex);
+    merge_provider_report(&mut report.claude, remote.claude);
 }
 
 fn merge_provider_report(dst: &mut ProviderReport, mut src: ProviderReport) {
@@ -1386,6 +1397,16 @@ fn parse_rfc3339_unix_ms(timestamp: &str) -> Option<i64> {
     i64::try_from(unix_ms).ok()
 }
 
+fn local_timezone_offset_seconds() -> i32 {
+    UtcOffset::current_local_offset()
+        .map(|offset| offset.whole_seconds())
+        .unwrap_or(0)
+}
+
+fn timezone_offset_from_seconds(offset_seconds: i32) -> UtcOffset {
+    UtcOffset::from_whole_seconds(offset_seconds).unwrap_or(UtcOffset::UTC)
+}
+
 fn observe_session_timestamp(
     timestamp: Option<&str>,
     first_unix_ms: &mut Option<i64>,
@@ -1406,16 +1427,24 @@ fn session_duration_seconds(first_unix_ms: Option<i64>, last_unix_ms: Option<i64
     }
 }
 
-fn timestamp_day_key(timestamp: Option<&str>) -> Option<String> {
+fn timestamp_day_key(timestamp: Option<&str>, timezone_offset_seconds: i32) -> Option<String> {
     let timestamp = timestamp?;
     let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
-    Some(day_key_from_date(parsed.date()))
+    Some(day_key_from_date(
+        parsed
+            .to_offset(timezone_offset_from_seconds(timezone_offset_seconds))
+            .date(),
+    ))
 }
 
-fn timestamp_hour_key(timestamp: Option<&str>) -> Option<u8> {
+fn timestamp_hour_key(timestamp: Option<&str>, timezone_offset_seconds: i32) -> Option<u8> {
     let timestamp = timestamp?;
     let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
-    Some(parsed.hour())
+    Some(
+        parsed
+            .to_offset(timezone_offset_from_seconds(timezone_offset_seconds))
+            .hour(),
+    )
 }
 
 fn day_key_from_date(date: Date) -> String {
@@ -1427,16 +1456,18 @@ fn day_key_from_date(date: Date) -> String {
     )
 }
 
-fn recent_day_keys(days: usize) -> Vec<String> {
-    recent_day_keys_at(days, now_unix_ms())
+fn recent_day_keys(days: usize, timezone_offset_seconds: i32) -> Vec<String> {
+    recent_day_keys_at(days, now_unix_ms(), timezone_offset_seconds)
 }
 
-fn recent_day_keys_at(days: usize, now_unix_ms: i64) -> Vec<String> {
+fn recent_day_keys_at(days: usize, now_unix_ms: i64, timezone_offset_seconds: i32) -> Vec<String> {
     let Ok(now) = OffsetDateTime::from_unix_timestamp_nanos(i128::from(now_unix_ms) * 1_000_000)
     else {
         return Vec::new();
     };
-    let today = now.date();
+    let today = now
+        .to_offset(timezone_offset_from_seconds(timezone_offset_seconds))
+        .date();
     let mut day_keys = Vec::with_capacity(days);
 
     for offset in (0..days).rev() {
@@ -1486,6 +1517,7 @@ fn build_topbar_snapshot_for_day_keys(report: &UsageReport, day_keys: &[String])
 
     TopBarSnapshot {
         scope: report.scope.clone(),
+        activity_timezone_offset_seconds: report.activity_timezone_offset_seconds,
         total_tokens: total.total_tokens(),
         total,
         estimated_cost_usd,
@@ -2080,9 +2112,10 @@ fn parse_codex_reader<R: BufRead>(
                                     )
                                     .or_default()
                                     .add_record(delta);
-                                if let Some(day_key) =
-                                    timestamp_day_key(parsed.timestamp.as_deref())
-                                {
+                                if let Some(day_key) = timestamp_day_key(
+                                    parsed.timestamp.as_deref(),
+                                    options.activity_timezone_offset_seconds,
+                                ) {
                                     day_model_usage
                                         .entry(day_key)
                                         .or_default()
@@ -2090,9 +2123,10 @@ fn parse_codex_reader<R: BufRead>(
                                         .or_default()
                                         .add_record(delta);
                                 }
-                                if let Some(hour_key) =
-                                    timestamp_hour_key(parsed.timestamp.as_deref())
-                                {
+                                if let Some(hour_key) = timestamp_hour_key(
+                                    parsed.timestamp.as_deref(),
+                                    options.activity_timezone_offset_seconds,
+                                ) {
                                     hour_model_usage
                                         .entry(hour_key)
                                         .or_default()
@@ -2232,8 +2266,14 @@ fn parse_claude_reader<R: BufRead>(
                             continue;
                         }
 
-                        let day_key = timestamp_day_key(parsed.timestamp.as_deref());
-                        let hour_key = timestamp_hour_key(parsed.timestamp.as_deref());
+                        let day_key = timestamp_day_key(
+                            parsed.timestamp.as_deref(),
+                            options.activity_timezone_offset_seconds,
+                        );
+                        let hour_key = timestamp_hour_key(
+                            parsed.timestamp.as_deref(),
+                            options.activity_timezone_offset_seconds,
+                        );
                         let model = model.unwrap_or_else(|| UNKNOWN_MODEL.to_string());
 
                         let key = parsed
@@ -2420,11 +2460,17 @@ fn classify_remote_mot_failure(host: &str, stderr: &str, stdout: &str) -> Option
         ));
     }
 
-    let unknown_json_flag = combined_lower.contains("--json")
-        && (combined_lower.contains("unexpected argument")
-            || combined_lower.contains("unknown argument")
-            || combined_lower.contains("unrecognized option")
-            || combined_lower.contains("invalid option"));
+    let unknown_activity_timezone_flag = combined_lower
+        .contains("--activity-timezone-offset-seconds")
+        && output_looks_like_unknown_argument(&combined_lower);
+    if unknown_activity_timezone_flag {
+        return Some(format!(
+            "host {host}: remote mot does not support timezone-aligned activity stats; skipping host (upgrade mot on remote)"
+        ));
+    }
+
+    let unknown_json_flag =
+        combined_lower.contains("--json") && output_looks_like_unknown_argument(&combined_lower);
     if unknown_json_flag {
         return Some(format!(
             "host {host}: remote mot does not support --json (older version); skipping host"
@@ -2432,6 +2478,13 @@ fn classify_remote_mot_failure(host: &str, stderr: &str, stdout: &str) -> Option
     }
 
     None
+}
+
+fn output_looks_like_unknown_argument(output: &str) -> bool {
+    output.contains("unexpected argument")
+        || output.contains("unknown argument")
+        || output.contains("unrecognized option")
+        || output.contains("invalid option")
 }
 
 fn classify_remote_mot_parse_failure(host: &str, stdout: &str, _stderr: &str) -> Option<String> {
@@ -2461,6 +2514,8 @@ fn build_remote_mot_script(options: &ScanOptions) -> String {
         args.push("--window".to_string());
         args.push(window.spec.clone());
     }
+    args.push("--activity-timezone-offset-seconds".to_string());
+    args.push(options.activity_timezone_offset_seconds.to_string());
     let command = args
         .iter()
         .map(|arg| shell_single_quote(arg))
@@ -2726,6 +2781,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -2762,6 +2818,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -2809,6 +2866,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -2888,6 +2946,7 @@ mod tests {
             }),
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -2936,6 +2995,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -2987,6 +3047,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -3022,6 +3083,47 @@ mod tests {
     }
 
     #[test]
+    fn activity_rollups_use_configured_timezone_offset() {
+        let temp = tempdir().expect("create tempdir");
+
+        let codex_root = temp.path().join("codex");
+        fs::create_dir_all(&codex_root).expect("create codex root");
+        fs::write(
+            codex_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/tmp/proj\",\"model\":\"gpt-5.2-codex\"}}\n",
+                "{\"timestamp\":\"2026-03-20T01:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":2}}}}\n"
+            ),
+        )
+        .expect("write codex session");
+
+        let options = ScanOptions {
+            global: true,
+            root: PathBuf::from("/tmp/proj"),
+            codex_root,
+            claude_root: temp.path().join("missing"),
+            parallel: false,
+            window: None,
+            ssh_hosts: Vec::new(),
+            selected_session: None,
+            activity_timezone_offset_seconds: -7 * 60 * 60,
+        };
+
+        let report = collect_usage(&options);
+
+        assert_eq!(report.codex.daily.len(), 1);
+        assert_eq!(report.codex.daily[0].day, "2026-03-19");
+        assert_eq!(report.codex.hourly.len(), 1);
+        assert_eq!(report.codex.hourly[0].hour, 18);
+
+        let day_keys = vec!["2026-03-19".to_string(), "2026-03-20".to_string()];
+        let snapshot = build_topbar_snapshot_for_day_keys(&report, &day_keys);
+        assert_eq!(snapshot.days[0].total_tokens, 105);
+        assert_eq!(snapshot.days[1].total_tokens, 0);
+    }
+
+    #[test]
     fn unknown_models_are_tracked_as_unpriced() {
         let temp = tempdir().expect("create tempdir");
         let codex_root = temp.path().join("codex");
@@ -3046,6 +3148,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -3092,6 +3195,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let report = collect_usage(&options);
@@ -3139,6 +3243,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
 
         let summaries = list_session_summaries(&options);
@@ -3194,6 +3299,7 @@ mod tests {
             window: None,
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         };
         options.selected_session =
             Some(resolve_session_selection(&options, "s2").expect("resolve selected session"));
@@ -3368,6 +3474,205 @@ mod tests {
     }
 
     #[test]
+    fn merge_remote_usage_report_for_host_combines_activity_stats() {
+        let mut report = UsageReport {
+            scope: ScopeReport {
+                mode: "global",
+                root: None,
+                window: None,
+                cutoff_unix_ms: None,
+                session: None,
+            },
+            activity_timezone_offset_seconds: -7 * 60 * 60,
+            codex: ProviderReport {
+                sessions_counted: 1,
+                records_counted: 1,
+                totals: TokenTotals {
+                    input: 10,
+                    ..TokenTotals::default()
+                },
+                daily: vec![DailyReport {
+                    day: "2026-03-19".to_string(),
+                    records_counted: 1,
+                    totals: TokenTotals {
+                        input: 10,
+                        ..TokenTotals::default()
+                    },
+                    estimated_cost_usd: 0.0,
+                }],
+                hourly: vec![HourlyReport {
+                    hour: 18,
+                    records_counted: 1,
+                    totals: TokenTotals {
+                        input: 10,
+                        ..TokenTotals::default()
+                    },
+                    estimated_cost_usd: 0.0,
+                }],
+                longest_session: Some(SessionActivityReport {
+                    total_tokens: 10,
+                    records_counted: 1,
+                    duration_seconds: 60,
+                }),
+                largest_session: Some(SessionActivityReport {
+                    total_tokens: 10,
+                    records_counted: 1,
+                    duration_seconds: 60,
+                }),
+                ..ProviderReport::default()
+            },
+            claude: ProviderReport::default(),
+            by_host: Vec::new(),
+            total: TokenTotals::default(),
+            estimated_cost_usd: 0.0,
+            priced_totals: TokenTotals::default(),
+            unpriced_totals: TokenTotals::default(),
+            unpriced_models: Vec::new(),
+            duration_ms: 0,
+        };
+
+        let remote = RemoteUsageReport {
+            codex: ProviderReport {
+                sessions_counted: 2,
+                records_counted: 2,
+                totals: TokenTotals {
+                    input: 70,
+                    ..TokenTotals::default()
+                },
+                daily: vec![
+                    DailyReport {
+                        day: "2026-03-19".to_string(),
+                        records_counted: 1,
+                        totals: TokenTotals {
+                            input: 30,
+                            ..TokenTotals::default()
+                        },
+                        estimated_cost_usd: 0.0,
+                    },
+                    DailyReport {
+                        day: "2026-03-20".to_string(),
+                        records_counted: 1,
+                        totals: TokenTotals {
+                            input: 40,
+                            ..TokenTotals::default()
+                        },
+                        estimated_cost_usd: 0.0,
+                    },
+                ],
+                hourly: vec![
+                    HourlyReport {
+                        hour: 18,
+                        records_counted: 1,
+                        totals: TokenTotals {
+                            input: 30,
+                            ..TokenTotals::default()
+                        },
+                        estimated_cost_usd: 0.0,
+                    },
+                    HourlyReport {
+                        hour: 19,
+                        records_counted: 1,
+                        totals: TokenTotals {
+                            input: 40,
+                            ..TokenTotals::default()
+                        },
+                        estimated_cost_usd: 0.0,
+                    },
+                ],
+                longest_session: Some(SessionActivityReport {
+                    total_tokens: 30,
+                    records_counted: 1,
+                    duration_seconds: 7_200,
+                }),
+                largest_session: Some(SessionActivityReport {
+                    total_tokens: 40,
+                    records_counted: 1,
+                    duration_seconds: 120,
+                }),
+                ..ProviderReport::default()
+            },
+            claude: ProviderReport {
+                sessions_counted: 1,
+                records_counted: 1,
+                totals: TokenTotals {
+                    output: 20,
+                    ..TokenTotals::default()
+                },
+                daily: vec![DailyReport {
+                    day: "2026-03-20".to_string(),
+                    records_counted: 1,
+                    totals: TokenTotals {
+                        output: 20,
+                        ..TokenTotals::default()
+                    },
+                    estimated_cost_usd: 0.0,
+                }],
+                hourly: vec![HourlyReport {
+                    hour: 19,
+                    records_counted: 1,
+                    totals: TokenTotals {
+                        output: 20,
+                        ..TokenTotals::default()
+                    },
+                    estimated_cost_usd: 0.0,
+                }],
+                ..ProviderReport::default()
+            },
+        };
+
+        merge_remote_usage_report_for_host(&mut report, "vm-a", remote);
+        refresh_usage_report_rollups(&mut report);
+
+        assert_eq!(report.codex.sessions_counted, 3);
+        assert_eq!(report.claude.sessions_counted, 1);
+        assert_eq!(
+            report
+                .codex
+                .daily
+                .iter()
+                .find(|day| day.day == "2026-03-19")
+                .map(|day| day.totals.input),
+            Some(40)
+        );
+        assert_eq!(
+            report
+                .codex
+                .hourly
+                .iter()
+                .find(|hour| hour.hour == 18)
+                .map(|hour| hour.totals.input),
+            Some(40)
+        );
+        assert_eq!(
+            report
+                .codex
+                .longest_session
+                .map(|session| session.duration_seconds),
+            Some(7_200)
+        );
+        assert_eq!(
+            report
+                .codex
+                .largest_session
+                .map(|session| session.total_tokens),
+            Some(40)
+        );
+        assert_eq!(
+            report
+                .by_host
+                .iter()
+                .find(|host| host.host == "vm-a")
+                .map(|host| host.totals.total_tokens()),
+            Some(90)
+        );
+
+        let day_keys = vec!["2026-03-19".to_string(), "2026-03-20".to_string()];
+        let snapshot = build_topbar_snapshot_for_day_keys(&report, &day_keys);
+        assert_eq!(snapshot.days[0].total_tokens, 40);
+        assert_eq!(snapshot.days[1].total_tokens, 60);
+    }
+
+    #[test]
     fn collapse_provider_to_host_merges_all_rows_into_target_host() {
         let mut provider = ProviderReport {
             by_host: vec![
@@ -3415,10 +3720,11 @@ mod tests {
             }),
             ssh_hosts: Vec::new(),
             selected_session: None,
+            activity_timezone_offset_seconds: 0,
         });
 
         assert!(script.contains("command -v mot"));
-        assert!(script.contains("'mot' '--json' '--root' '/tmp/proj' '--window' '7d'"));
+        assert!(script.contains("'mot' '--json' '--root' '/tmp/proj' '--window' '7d' '--activity-timezone-offset-seconds' '0'"));
     }
 
     #[test]
@@ -3443,6 +3749,14 @@ mod tests {
         let warning = classify_remote_mot_failure("vm-a", stderr, "").expect("expected warning");
         assert!(warning.contains("does not support --json"));
         assert!(warning.contains("skipping host"));
+    }
+
+    #[test]
+    fn classify_remote_mot_failure_detects_old_activity_timezone_flag() {
+        let stderr = "error: unexpected argument '--activity-timezone-offset-seconds' found";
+        let warning = classify_remote_mot_failure("vm-a", stderr, "").expect("expected warning");
+        assert!(warning.contains("timezone-aligned activity stats"));
+        assert!(warning.contains("upgrade mot on remote"));
     }
 
     #[test]
