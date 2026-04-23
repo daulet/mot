@@ -17,14 +17,13 @@ mot --global --ssh-host vm-a --ssh-host vm-b # include remote VM sessions over S
 
 Sample output:
 ```
-Scanned: codex 1440 files, claude 339 files, droid 85 files in 273 ms
-Counted: codex 26 sessions, claude 250 assistant responses, droid 85 sessions
+Scanned: codex 1440 files, claude 339 files in 273 ms
+Counted: codex 26 sessions, claude 250 assistant responses
 
 Provider            Input         Output       Thinking     Cache Read    Cache Write      Est. Cost
 Codex         143,995,252        785,532        467,276    135,731,584              0        $286.74
 Claude             10,123            981              0     19,440,609        343,559         $10.01
-Droid                 493         48,106          4,117     13,176,535        747,883         $16.83
-Total         144,005,868        834,619        471,393    168,348,728      1,091,442        $313.58
+Total         144,005,375        786,513        467,276    155,172,193        343,559        $296.75
 
 By model:
 Provider   Model                                 Input         Output       Thinking     Cache Read    Cache Write      Est. Cost
@@ -33,7 +32,6 @@ Codex      gpt-5.2-codex                     6,785,012        107,898         71
 Claude     claude-opus-4-5-20251101              1,396            336              0     17,359,560        108,704          $9.37
 Claude     claude-haiku-4-5-20251001             8,723            168              0      2,059,925        213,354        $0.4822
 Claude     claude-opus-4-6                           4            477              0         21,124         21,501        $0.1569
-Droid      claude-opus-4-5-20251101                493         48,106          4,117     13,176,535        747,883         $16.83
 ```
 
 When stdout is an interactive terminal, table output also renders a GitHub-style
@@ -45,15 +43,11 @@ the daily rollups:
   session that spans multiple days contributes to each active day.
 - Claude: assistant responses are deduplicated by request/message id, then
   assigned to their response timestamp.
-- Droid: Factory settings expose aggregate session token usage, so activity is
-  assigned to `providerLockTimestamp`.
 
 The calendar footer shows favorite model, total tokens, sessions, largest
 session by token volume, current and longest streaks, active days since first
 activity in the displayed calendar range, longest session by duration, and peak
-hour. Peak hour is computed from Codex and Claude timestamped usage records.
-Droid is excluded from peak hour because its available usage is
-session-aggregate metadata.
+hour.
 
 The footer also includes a randomly selected book-scale comparison. Book word
 counts are converted to estimated tokens using the English rule of thumb that
@@ -79,7 +73,7 @@ mot --global --ssh-host user@vm-a --ssh-host user@vm-b
 
 Notes:
 
-- Remote scanning reads the same default directories as local mode: `~/.codex/sessions`, `~/.claude/projects`, and `~/.factory/sessions`.
+- Remote scanning reads the same default directories as local mode: `~/.codex/sessions` and `~/.claude/projects`.
 - It shells out to local `ssh` and runs `mot --json` on the remote host, so `mot` must be installed remotely and available in `PATH`.
 - If a remote host has an older/incompatible `mot` (or missing `mot`), that host is skipped and surfaced in `Warnings` output.
 - For cross-host aggregation, `--global` is usually the right choice because scoped mode still filters by the recorded session `cwd`.

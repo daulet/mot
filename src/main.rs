@@ -153,9 +153,6 @@ struct Cli {
 
     #[arg(long, value_name = "PATH", hide = true)]
     claude_root: Option<PathBuf>,
-
-    #[arg(long, value_name = "PATH", hide = true)]
-    droid_root: Option<PathBuf>,
 }
 
 fn resolve_runtime_version() -> &'static str {
@@ -203,9 +200,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(claude_root) = cli.claude_root {
         options.claude_root = claude_root;
-    }
-    if let Some(droid_root) = cli.droid_root {
-        options.droid_root = droid_root;
     }
 
     if (cli.session.is_some() || cli.select_session) && has_ssh_hosts {
@@ -349,9 +343,7 @@ struct ActivityStats {
 }
 
 fn total_sessions(report: &mot::UsageReport) -> usize {
-    provider_sessions_counted(&report.codex)
-        + provider_sessions_counted(&report.claude)
-        + provider_sessions_counted(&report.droid)
+    provider_sessions_counted(&report.codex) + provider_sessions_counted(&report.claude)
 }
 
 fn provider_sessions_counted(provider: &mot::ProviderReport) -> usize {
@@ -366,13 +358,7 @@ fn provider_sessions_counted(provider: &mot::ProviderReport) -> usize {
 
 fn favorite_model_from_report(report: &mot::UsageReport) -> Option<String> {
     let mut totals_by_model: HashMap<String, (u64, usize)> = HashMap::new();
-    for model in report
-        .codex
-        .by_model
-        .iter()
-        .chain(&report.claude.by_model)
-        .chain(&report.droid.by_model)
-    {
+    for model in report.codex.by_model.iter().chain(&report.claude.by_model) {
         let total_tokens = model.totals.total_tokens();
         if total_tokens == 0 {
             continue;
@@ -402,27 +388,19 @@ fn favorite_model_from_report(report: &mot::UsageReport) -> Option<String> {
 }
 
 fn longest_session_duration_seconds_from_report(report: &mot::UsageReport) -> Option<u64> {
-    [
-        report.codex.longest_session,
-        report.claude.longest_session,
-        report.droid.longest_session,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|session| session.duration_seconds)
-    .max()
+    [report.codex.longest_session, report.claude.longest_session]
+        .into_iter()
+        .flatten()
+        .map(|session| session.duration_seconds)
+        .max()
 }
 
 fn largest_session_tokens_from_report(report: &mot::UsageReport) -> Option<u64> {
-    [
-        report.codex.largest_session,
-        report.claude.largest_session,
-        report.droid.largest_session,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|session| session.total_tokens)
-    .max()
+    [report.codex.largest_session, report.claude.largest_session]
+        .into_iter()
+        .flatten()
+        .map(|session| session.total_tokens)
+        .max()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1580,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn peak_hour_combines_codex_and_claude_and_ignores_droid() {
+    fn peak_hour_combines_codex_and_claude() {
         let mut report = empty_usage_report();
         report.codex.hourly.push(mot::HourlyReport {
             hour: 14,
@@ -1606,15 +1584,6 @@ mod tests {
             },
             ..mot::HourlyReport::default()
         });
-        report.droid.hourly.push(mot::HourlyReport {
-            hour: 22,
-            totals: TokenTotals {
-                input: 10_000,
-                ..TokenTotals::default()
-            },
-            ..mot::HourlyReport::default()
-        });
-
         assert_eq!(
             super::peak_hour_from_report(&report),
             Some(super::PeakHour {
@@ -1645,6 +1614,11 @@ mod tests {
             pricing: None,
         });
         report.claude.sessions_counted = 1;
+        report.claude.longest_session = Some(mot::SessionActivityReport {
+            total_tokens: 10_000,
+            records_counted: 1,
+            duration_seconds: 86_400,
+        });
         report.claude.largest_session = Some(mot::SessionActivityReport {
             total_tokens: 25_000,
             records_counted: 1,
@@ -1660,28 +1634,11 @@ mod tests {
             estimated_cost_usd: None,
             pricing: None,
         });
-        report.droid.sessions_counted = 3;
-        report.droid.longest_session = Some(mot::SessionActivityReport {
-            total_tokens: 10_000,
-            records_counted: 1,
-            duration_seconds: 86_400,
-        });
-        report.droid.largest_session = report.droid.longest_session;
-        report.droid.by_model.push(mot::ModelReport {
-            model: "gpt-5.4".to_string(),
-            records_counted: 3,
-            totals: TokenTotals {
-                input: 150,
-                ..TokenTotals::default()
-            },
-            estimated_cost_usd: None,
-            pricing: None,
-        });
 
         let stats = super::activity_report_stats(&report);
 
-        assert_eq!(stats.total_sessions, 6);
-        assert_eq!(stats.favorite_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(stats.total_sessions, 3);
+        assert_eq!(stats.favorite_model.as_deref(), Some("claude-sonnet"));
         assert_eq!(stats.largest_session_tokens, Some(25_000));
         assert_eq!(stats.longest_session_duration_seconds, Some(86_400));
     }
@@ -1772,7 +1729,6 @@ mod tests {
             },
             codex: mot::ProviderReport::default(),
             claude: mot::ProviderReport::default(),
-            droid: mot::ProviderReport::default(),
             by_host: Vec::new(),
             total: TokenTotals::default(),
             estimated_cost_usd: 0.0,

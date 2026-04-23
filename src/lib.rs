@@ -340,7 +340,6 @@ pub struct UsageReport {
     pub scope: ScopeReport,
     pub codex: ProviderReport,
     pub claude: ProviderReport,
-    pub droid: ProviderReport,
     pub by_host: Vec<HostReport>,
     pub total: TokenTotals,
     pub estimated_cost_usd: f64,
@@ -356,8 +355,6 @@ struct RemoteUsageReport {
     codex: ProviderReport,
     #[serde(default)]
     claude: ProviderReport,
-    #[serde(default)]
-    droid: ProviderReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -383,7 +380,6 @@ pub struct ScanOptions {
     pub root: PathBuf,
     pub codex_root: PathBuf,
     pub claude_root: PathBuf,
-    pub droid_root: PathBuf,
     pub parallel: bool,
     pub window: Option<TimeWindow>,
     pub ssh_hosts: Vec<String>,
@@ -408,7 +404,6 @@ impl Default for ScanOptions {
             root: cwd,
             codex_root: home.join(".codex").join("sessions"),
             claude_root: home.join(".claude").join("projects"),
-            droid_root: home.join(".factory").join("sessions"),
             parallel: true,
             window: None,
             ssh_hosts: Vec::new(),
@@ -422,7 +417,6 @@ impl Default for ScanOptions {
 pub enum SessionProvider {
     Codex,
     Claude,
-    Droid,
 }
 
 impl SessionProvider {
@@ -430,7 +424,6 @@ impl SessionProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
-            Self::Droid => "droid",
         }
     }
 }
@@ -542,23 +535,14 @@ pub fn resolve_scope_root(root: Option<PathBuf>) -> PathBuf {
 pub fn collect_usage(options: &ScanOptions) -> UsageReport {
     let started = Instant::now();
 
-    let (mut codex, mut claude, mut droid) = if options.parallel {
-        let ((codex, claude), droid) = rayon::join(
-            || rayon::join(|| scan_all_codex(options), || scan_all_claude(options)),
-            || scan_all_droid(options),
-        );
-        (codex, claude, droid)
+    let (mut codex, mut claude) = if options.parallel {
+        rayon::join(|| scan_all_codex(options), || scan_all_claude(options))
     } else {
-        (
-            scan_all_codex(options),
-            scan_all_claude(options),
-            scan_all_droid(options),
-        )
+        (scan_all_codex(options), scan_all_claude(options))
     };
 
     finalize_provider_pricing(&mut codex);
     finalize_provider_pricing(&mut claude);
-    finalize_provider_pricing_with(&mut droid, lookup_droid_pricing);
 
     let mut report = UsageReport {
         scope: ScopeReport {
@@ -575,7 +559,6 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
         total: TokenTotals::default(),
         codex,
         claude,
-        droid,
         by_host: Vec::new(),
         estimated_cost_usd: 0.0,
         priced_totals: TokenTotals::default(),
@@ -623,15 +606,12 @@ pub fn render_report(report: &UsageReport) -> String {
     }
 
     out.push_str(&format!(
-        "Scanned: codex {} files, claude {} files, droid {} files in {} ms\n",
-        report.codex.files_scanned,
-        report.claude.files_scanned,
-        report.droid.files_scanned,
-        report.duration_ms
+        "Scanned: codex {} files, claude {} files in {} ms\n",
+        report.codex.files_scanned, report.claude.files_scanned, report.duration_ms
     ));
     out.push_str(&format!(
-        "Counted: codex {} sessions, claude {} assistant responses, droid {} sessions\n\n",
-        report.codex.records_counted, report.claude.records_counted, report.droid.records_counted
+        "Counted: codex {} sessions, claude {} assistant responses\n\n",
+        report.codex.records_counted, report.claude.records_counted
     ));
 
     out.push_str(&format!(
@@ -651,12 +631,6 @@ pub fn render_report(report: &UsageReport) -> String {
         &report.claude.totals,
         report.claude.estimated_cost_usd,
     );
-    push_row(
-        &mut out,
-        "Droid",
-        &report.droid.totals,
-        report.droid.estimated_cost_usd,
-    );
     push_row(&mut out, "Total", &report.total, report.estimated_cost_usd);
 
     if !report.by_host.is_empty() {
@@ -671,10 +645,7 @@ pub fn render_report(report: &UsageReport) -> String {
         }
     }
 
-    if !report.codex.by_model.is_empty()
-        || !report.claude.by_model.is_empty()
-        || !report.droid.by_model.is_empty()
-    {
+    if !report.codex.by_model.is_empty() || !report.claude.by_model.is_empty() {
         out.push_str("\nBy model:\n");
         out.push_str(&format!(
             "{:<10} {:<28} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
@@ -694,14 +665,9 @@ pub fn render_report(report: &UsageReport) -> String {
         for model in &report.claude.by_model {
             push_model_row(&mut out, "Claude", model);
         }
-        for model in &report.droid.by_model {
-            push_model_row(&mut out, "Droid", model);
-        }
     }
 
-    out.push_str(
-        "\nPricing: Codex/Claude standard API (non-priority); Droid Factory Standard Tokens\n",
-    );
+    out.push_str("\nPricing: Codex/Claude standard API (non-priority)\n");
     if !report.unpriced_totals.is_zero() {
         out.push_str(&format!(
             "Unpriced tokens: input {}, output {}, thinking {}, cache read {}, cache write {}\n",
@@ -719,29 +685,20 @@ pub fn render_report(report: &UsageReport) -> String {
         }
     }
 
-    if report.codex.parse_errors > 0
-        || report.claude.parse_errors > 0
-        || report.droid.parse_errors > 0
-    {
+    if report.codex.parse_errors > 0 || report.claude.parse_errors > 0 {
         out.push_str(&format!(
-            "\nParse warnings: codex {}, claude {}, droid {}\n",
-            report.codex.parse_errors, report.claude.parse_errors, report.droid.parse_errors
+            "\nParse warnings: codex {}, claude {}\n",
+            report.codex.parse_errors, report.claude.parse_errors
         ));
     }
 
-    if !report.codex.warnings.is_empty()
-        || !report.claude.warnings.is_empty()
-        || !report.droid.warnings.is_empty()
-    {
+    if !report.codex.warnings.is_empty() || !report.claude.warnings.is_empty() {
         out.push_str("\nWarnings:\n");
         for warning in &report.codex.warnings {
             out.push_str(&format!("Codex: {warning}\n"));
         }
         for warning in &report.claude.warnings {
             out.push_str(&format!("Claude: {warning}\n"));
-        }
-        for warning in &report.droid.warnings {
-            out.push_str(&format!("Droid: {warning}\n"));
         }
     }
 
@@ -1034,29 +991,20 @@ fn combine_host_reports<'a>(
 }
 
 fn refresh_usage_report_rollups(report: &mut UsageReport) {
-    report.total = report.codex.totals + report.claude.totals + report.droid.totals;
-    report.priced_totals =
-        report.codex.priced_totals + report.claude.priced_totals + report.droid.priced_totals;
-    report.unpriced_totals =
-        report.codex.unpriced_totals + report.claude.unpriced_totals + report.droid.unpriced_totals;
-    report.estimated_cost_usd = report.codex.estimated_cost_usd
-        + report.claude.estimated_cost_usd
-        + report.droid.estimated_cost_usd;
+    report.total = report.codex.totals + report.claude.totals;
+    report.priced_totals = report.codex.priced_totals + report.claude.priced_totals;
+    report.unpriced_totals = report.codex.unpriced_totals + report.claude.unpriced_totals;
+    report.estimated_cost_usd = report.codex.estimated_cost_usd + report.claude.estimated_cost_usd;
 
     let mut unpriced_models = report.codex.unpriced_models.clone();
-    for model in report
-        .claude
-        .unpriced_models
-        .iter()
-        .chain(&report.droid.unpriced_models)
-    {
+    for model in &report.claude.unpriced_models {
         if !unpriced_models.contains(model) {
             unpriced_models.push(model.clone());
         }
     }
     unpriced_models.sort();
     report.unpriced_models = unpriced_models;
-    report.by_host = combine_host_reports([&report.codex, &report.claude, &report.droid]);
+    report.by_host = combine_host_reports([&report.codex, &report.claude]);
 }
 
 fn merge_remote_host_reports(report: &mut UsageReport, options: &ScanOptions) {
@@ -1083,10 +1031,8 @@ fn merge_remote_host_reports(report: &mut UsageReport, options: &ScanOptions) {
             Ok(mut remote) => {
                 collapse_provider_to_host(&mut remote.codex, &host);
                 collapse_provider_to_host(&mut remote.claude, &host);
-                collapse_provider_to_host(&mut remote.droid, &host);
                 merge_provider_report(&mut report.codex, remote.codex);
                 merge_provider_report(&mut report.claude, remote.claude);
-                merge_provider_report(&mut report.droid, remote.droid);
             }
             Err(warning) => {
                 report.codex.warnings.push(warning);
@@ -1383,102 +1329,6 @@ const ANTHROPIC_PRICING_RULES: &[PricingRule] = &[
     },
 ];
 
-// Factory Droid pricing based on Standard Tokens with per-model multipliers.
-// Source: https://docs.factory.ai/pricing (2026-03-30)
-//
-// All token types cost multiplier × $10/M tokens, except cached reads
-// which cost multiplier × $1/M tokens (1/10th discount).
-const fn droid_pricing(multiplier: f64) -> ModelPricing {
-    pricing(
-        multiplier * 10.0,
-        multiplier * 10.0,
-        multiplier * 1.0,
-        multiplier * 10.0,
-    )
-}
-
-const DROID_PRICING_RULES: &[PricingRule] = &[
-    PricingRule {
-        patterns: &["minimax-m2.5"],
-        pricing: droid_pricing(0.12),
-    },
-    PricingRule {
-        patterns: &["gemini-3-flash-preview"],
-        pricing: droid_pricing(0.2),
-    },
-    PricingRule {
-        patterns: &["glm-4.7"],
-        pricing: droid_pricing(0.25),
-    },
-    PricingRule {
-        patterns: &["kimi-k2.5"],
-        pricing: droid_pricing(0.25),
-    },
-    PricingRule {
-        patterns: &["claude-haiku-4-5", "claude-4-5-haiku"],
-        pricing: droid_pricing(0.4),
-    },
-    PricingRule {
-        patterns: &["glm-5"],
-        pricing: droid_pricing(0.4),
-    },
-    PricingRule {
-        patterns: &["gpt-5.2-codex", "gpt-5.2"],
-        pricing: droid_pricing(0.7),
-    },
-    PricingRule {
-        patterns: &["gpt-5.3-codex"],
-        pricing: droid_pricing(0.7),
-    },
-    PricingRule {
-        patterns: &["gemini-3.1-pro-preview"],
-        pricing: droid_pricing(0.8),
-    },
-    PricingRule {
-        patterns: &["gpt-5.4"],
-        pricing: droid_pricing(1.0),
-    },
-    PricingRule {
-        patterns: &["claude-sonnet-4-6"],
-        pricing: droid_pricing(1.2),
-    },
-    PricingRule {
-        patterns: &["claude-sonnet-4-5"],
-        pricing: droid_pricing(1.2),
-    },
-    PricingRule {
-        patterns: &["claude-opus-4-6-fast"],
-        pricing: droid_pricing(12.0),
-    },
-    PricingRule {
-        patterns: &["claude-opus-4-6"],
-        pricing: droid_pricing(2.0),
-    },
-    PricingRule {
-        patterns: &["claude-opus-4-5"],
-        pricing: droid_pricing(2.0),
-    },
-];
-
-fn lookup_droid_pricing(model: &str) -> Option<ModelPricing> {
-    let normalized = model.trim().to_ascii_lowercase();
-    if normalized.is_empty() || normalized == UNKNOWN_MODEL {
-        return None;
-    }
-
-    for rule in DROID_PRICING_RULES {
-        if rule
-            .patterns
-            .iter()
-            .any(|pattern| model_rule_matches(&normalized, pattern))
-        {
-            return Some(rule.pricing);
-        }
-    }
-
-    None
-}
-
 fn lookup_model_pricing(model: &str) -> Option<ModelPricing> {
     let normalized = model.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized == UNKNOWN_MODEL {
@@ -1613,13 +1463,7 @@ fn build_topbar_snapshot_for_day_keys(report: &UsageReport, day_keys: &[String])
         })
         .collect();
 
-    for provider_day in report
-        .codex
-        .daily
-        .iter()
-        .chain(&report.claude.daily)
-        .chain(&report.droid.daily)
-    {
+    for provider_day in report.codex.daily.iter().chain(&report.claude.daily) {
         let Some(day) = days_by_key.get_mut(&provider_day.day) else {
             continue;
         };
@@ -1681,12 +1525,6 @@ pub fn list_session_summaries(options: &ScanOptions) -> Vec<SessionSummary> {
 
     for path in discover_jsonl_files(&options.claude_root) {
         if let Some(summary) = summarize_claude_session_file(&path) {
-            sessions.push(summary);
-        }
-    }
-
-    for path in discover_settings_files(&options.droid_root) {
-        if let Some(summary) = summarize_droid_session_file(&path) {
             sessions.push(summary);
         }
     }
@@ -1755,34 +1593,15 @@ fn summarize_explicit_session_path(options: &ScanOptions, query: &str) -> Option
         return None;
     }
 
-    if absolute_path
-        .to_str()
-        .is_some_and(|path| path.ends_with(".settings.json"))
-    {
-        return summarize_droid_session_file(&absolute_path);
-    }
-
     if absolute_path.starts_with(&options.codex_root) {
         return summarize_codex_session_file(&absolute_path);
     }
     if absolute_path.starts_with(&options.claude_root) {
         return summarize_claude_session_file(&absolute_path);
     }
-    if absolute_path.starts_with(&options.droid_root) {
-        let settings_path = if absolute_path
-            .to_str()
-            .is_some_and(|path| path.ends_with(".jsonl"))
-        {
-            jsonl_path_to_settings(&absolute_path)
-        } else {
-            absolute_path.clone()
-        };
-        return summarize_droid_session_file(&settings_path);
-    }
 
     summarize_codex_session_file(&absolute_path)
         .or_else(|| summarize_claude_session_file(&absolute_path))
-        .or_else(|| summarize_droid_session_file(&absolute_path))
 }
 
 fn session_summary_in_scope(summary: &SessionSummary, options: &ScanOptions) -> bool {
@@ -1998,74 +1817,6 @@ fn summarize_claude_session_file(path: &Path) -> Option<SessionSummary> {
     })
 }
 
-fn summarize_droid_session_file(settings_path: &Path) -> Option<SessionSummary> {
-    let settings: DroidSettings = File::open(settings_path)
-        .ok()
-        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok())?;
-
-    let jsonl_path = settings_path_to_jsonl(settings_path);
-    let (cwd, turns, first_prompt, started_at) = summarize_droid_jsonl(&jsonl_path);
-
-    Some(SessionSummary {
-        provider: SessionProvider::Droid,
-        id: droid_session_id_from_settings_path(settings_path),
-        path: settings_path.to_path_buf(),
-        cwd,
-        started_at,
-        updated_at: settings.provider_lock_timestamp,
-        turns,
-        first_prompt,
-    })
-}
-
-fn summarize_droid_jsonl(
-    jsonl_path: &Path,
-) -> (Option<PathBuf>, usize, Option<String>, Option<String>) {
-    let Some(file) = File::open(jsonl_path).ok() else {
-        return (None, 0, None, None);
-    };
-    let mut reader = BufReader::with_capacity(256 * 1024, file);
-    let mut line = String::new();
-    let mut cwd: Option<PathBuf> = None;
-    let mut turns = 0usize;
-    let mut first_prompt: Option<String> = None;
-    let mut started_at: Option<String> = None;
-
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
-                    started_at.get_or_insert_with(|| timestamp.to_string());
-                }
-                if value.get("type").and_then(Value::as_str) == Some("session_start")
-                    && let Some(line_cwd) = value.get("cwd").and_then(Value::as_str)
-                {
-                    cwd = Some(PathBuf::from(line_cwd));
-                }
-                let role = value
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("type").and_then(Value::as_str));
-                if role != Some("user") {
-                    continue;
-                }
-                if let Some(prompt) = extract_user_prompt_from_content(value.get("content")) {
-                    turns += 1;
-                    first_prompt.get_or_insert(prompt);
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    (cwd, turns, first_prompt, started_at)
-}
-
 fn extract_user_prompt_from_content(content: Option<&Value>) -> Option<String> {
     let text = extract_content_text(content?)?;
     let text = normalize_prompt_snippet(&text);
@@ -2131,24 +1882,6 @@ fn session_id_from_path(path: &Path) -> String {
     stem.strip_prefix("rollout-").unwrap_or(stem).to_string()
 }
 
-fn droid_session_id_from_settings_path(settings_path: &Path) -> String {
-    settings_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_suffix(".settings.json"))
-        .unwrap_or("<unknown>")
-        .to_string()
-}
-
-fn jsonl_path_to_settings(jsonl_path: &Path) -> PathBuf {
-    let name = jsonl_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    let settings_name = name.replace(".jsonl", ".settings.json");
-    jsonl_path.with_file_name(settings_name)
-}
-
 fn scan_all_codex(options: &ScanOptions) -> ProviderReport {
     if let Some(session) = &options.selected_session {
         if session.provider != SessionProvider::Codex {
@@ -2171,18 +1904,6 @@ fn scan_all_claude(options: &ScanOptions) -> ProviderReport {
 
     let local_files = discover_jsonl_files(&options.claude_root);
     scan_claude_files(&local_files, options)
-}
-
-fn scan_all_droid(options: &ScanOptions) -> ProviderReport {
-    if let Some(session) = &options.selected_session {
-        if session.provider != SessionProvider::Droid {
-            return ProviderReport::default();
-        }
-        return scan_droid_files(std::slice::from_ref(&session.path), options);
-    }
-
-    let local_files = discover_settings_files(&options.droid_root);
-    scan_droid_files(&local_files, options)
 }
 
 fn scan_codex_files(files: &[PathBuf], options: &ScanOptions) -> ProviderReport {
@@ -2972,242 +2693,6 @@ impl ClaudeUsage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct DroidSessionStart {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    timestamp: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DroidSettings {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(rename = "tokenUsage")]
-    token_usage: Option<DroidTokenUsage>,
-    #[serde(rename = "providerLockTimestamp")]
-    provider_lock_timestamp: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct DroidTokenUsage {
-    #[serde(rename = "inputTokens", default)]
-    input_tokens: u64,
-    #[serde(rename = "outputTokens", default)]
-    output_tokens: u64,
-    #[serde(rename = "cacheCreationTokens", default)]
-    cache_creation_tokens: u64,
-    #[serde(rename = "cacheReadTokens", default)]
-    cache_read_tokens: u64,
-    #[serde(rename = "thinkingTokens", default)]
-    thinking_tokens: u64,
-}
-
-impl DroidTokenUsage {
-    fn to_totals(&self) -> TokenTotals {
-        TokenTotals {
-            input: self.input_tokens,
-            output: self.output_tokens,
-            thinking: self.thinking_tokens,
-            cache_read: self.cache_read_tokens,
-            cache_write: self.cache_creation_tokens,
-        }
-    }
-}
-
-fn discover_settings_files(root: &Path) -> Vec<PathBuf> {
-    if !root.exists() {
-        return Vec::new();
-    }
-
-    WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter(|entry| {
-            entry
-                .path()
-                .to_str()
-                .is_some_and(|s| s.ends_with(".settings.json"))
-        })
-        .map(|entry| entry.into_path())
-        .collect()
-}
-
-fn scan_droid_files(files: &[PathBuf], options: &ScanOptions) -> ProviderReport {
-    scan_droid_files_with_host_label(files, LOCAL_HOST_LABEL, options)
-}
-
-fn scan_droid_files_with_host_label(
-    files: &[PathBuf],
-    host_label: &str,
-    options: &ScanOptions,
-) -> ProviderReport {
-    if options.parallel {
-        files
-            .par_iter()
-            .map(|path| scan_droid_file_with_host_label(path, host_label, options))
-            .reduce(ProviderReport::default, |a, b| a + b)
-    } else {
-        files
-            .iter()
-            .map(|path| scan_droid_file_with_host_label(path, host_label, options))
-            .fold(ProviderReport::default(), |acc, item| acc + item)
-    }
-}
-
-fn scan_droid_file_with_host_label(
-    settings_path: &Path,
-    host_label: &str,
-    options: &ScanOptions,
-) -> ProviderReport {
-    let settings: DroidSettings = match File::open(settings_path)
-        .ok()
-        .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok())
-    {
-        Some(s) => s,
-        None => {
-            return ProviderReport {
-                files_scanned: 1,
-                parse_errors: 1,
-                ..ProviderReport::default()
-            };
-        }
-    };
-
-    let jsonl_path = settings_path_to_jsonl(settings_path);
-    let session_metadata = read_droid_session_metadata(&jsonl_path);
-
-    build_droid_report_from_settings(
-        settings,
-        host_label,
-        session_metadata.cwd.as_deref(),
-        session_metadata.started_at.as_deref(),
-        options,
-    )
-}
-
-fn settings_path_to_jsonl(settings_path: &Path) -> PathBuf {
-    let name = settings_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    let jsonl_name = name.replace(".settings.json", ".jsonl");
-    settings_path.with_file_name(jsonl_name)
-}
-
-#[derive(Debug, Default)]
-struct DroidSessionMetadata {
-    cwd: Option<String>,
-    started_at: Option<String>,
-}
-
-fn read_droid_session_metadata(jsonl_path: &Path) -> DroidSessionMetadata {
-    let Some(file) = File::open(jsonl_path).ok() else {
-        return DroidSessionMetadata::default();
-    };
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return DroidSessionMetadata::default();
-    }
-    let Some(parsed) = serde_json::from_str::<DroidSessionStart>(&line).ok() else {
-        return DroidSessionMetadata::default();
-    };
-    if parsed.kind != "session_start" {
-        return DroidSessionMetadata::default();
-    }
-
-    DroidSessionMetadata {
-        cwd: parsed.cwd,
-        started_at: parsed.timestamp,
-    }
-}
-
-fn build_droid_report_from_settings(
-    settings: DroidSettings,
-    host_label: &str,
-    session_cwd: Option<&str>,
-    session_started_at: Option<&str>,
-    options: &ScanOptions,
-) -> ProviderReport {
-    let DroidSettings {
-        model,
-        token_usage,
-        provider_lock_timestamp,
-    } = settings;
-
-    let mut report = ProviderReport {
-        files_scanned: 1,
-        ..ProviderReport::default()
-    };
-
-    let usage = match token_usage {
-        Some(u) => u,
-        None => return report,
-    };
-
-    let totals = usage.to_totals();
-    if totals.is_zero() {
-        return report;
-    }
-
-    let timestamp = provider_lock_timestamp.as_deref();
-    if !timestamp_in_window(timestamp, options.window.as_ref()) {
-        return report;
-    }
-
-    if !options.global && options.selected_session.is_none() {
-        match session_cwd {
-            Some(cwd) if path_in_scope(Path::new(cwd), &options.root) => {}
-            _ => return report,
-        }
-    }
-
-    let model = model.unwrap_or_else(|| UNKNOWN_MODEL.to_string());
-    report.records_counted = 1;
-    report.sessions_counted = 1;
-    report.totals = totals;
-    let session_activity = SessionActivityReport {
-        total_tokens: totals.total_tokens(),
-        records_counted: report.records_counted,
-        duration_seconds: session_duration_seconds(
-            session_started_at.and_then(parse_rfc3339_unix_ms),
-            timestamp.and_then(parse_rfc3339_unix_ms),
-        ),
-    };
-    report.longest_session = Some(session_activity);
-    report.largest_session = Some(session_activity);
-    report
-        .model_usage
-        .entry(model.clone())
-        .or_default()
-        .add_record(totals);
-    report
-        .host_model_usage
-        .entry(host_label.to_string())
-        .or_default()
-        .entry(model.clone())
-        .or_default()
-        .add_record(totals);
-
-    if let Some(day_key) = timestamp_day_key(timestamp) {
-        report
-            .day_model_usage
-            .entry(day_key)
-            .or_default()
-            .entry(model)
-            .or_default()
-            .add_record(totals);
-    }
-
-    report
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3237,7 +2722,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root: codex_root.clone(),
             claude_root: temp.path().join("missing"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3274,7 +2758,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root: temp.path().join("missing"),
             claude_root: temp.path().join("claude/projects"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3322,7 +2805,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root,
             claude_root: temp.path().join("claude/projects"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3399,7 +2881,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root,
             claude_root: temp.path().join("claude/projects"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: Some(TimeWindow {
                 spec: "7d".to_string(),
@@ -3451,7 +2932,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root,
             claude_root: temp.path().join("claude/projects"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3503,7 +2983,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root,
             claude_root: temp.path().join("claude/projects"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3540,7 +3019,6 @@ mod tests {
                 .map(|hour| hour.totals.total_tokens()),
             Some(67)
         );
-        assert!(report.droid.hourly.is_empty());
     }
 
     #[test]
@@ -3564,7 +3042,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root,
             claude_root: temp.path().join("missing"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3611,7 +3088,6 @@ mod tests {
             root: PathBuf::from("/tmp/in-scope"),
             codex_root,
             claude_root: temp.path().join("claude/projects"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3659,7 +3135,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root,
             claude_root: temp.path().join("missing"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3715,7 +3190,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root,
             claude_root: temp.path().join("claude/projects"),
-            droid_root: temp.path().join("missing"),
             parallel: false,
             window: None,
             ssh_hosts: Vec::new(),
@@ -3741,177 +3215,6 @@ mod tests {
         let rendered = render_report(&report);
         assert!(rendered.contains("Session: codex s2"));
         assert!(rendered.contains("First prompt: Second session"));
-    }
-
-    #[test]
-    fn droid_pricing_uses_standard_token_multipliers() {
-        let opus = lookup_droid_pricing("claude-opus-4-5-20251101").expect("opus 4.5 pricing");
-        assert!((opus.input_per_mtok_usd - 20.0).abs() < 1e-12);
-        assert!((opus.output_per_mtok_usd - 20.0).abs() < 1e-12);
-        assert!((opus.cache_read_per_mtok_usd - 2.0).abs() < 1e-12);
-        assert!((opus.cache_write_per_mtok_usd - 20.0).abs() < 1e-12);
-
-        let sonnet =
-            lookup_droid_pricing("claude-sonnet-4-5-20250929").expect("sonnet 4.5 pricing");
-        assert!((sonnet.input_per_mtok_usd - 12.0).abs() < 1e-12);
-        assert!((sonnet.cache_read_per_mtok_usd - 1.2).abs() < 1e-12);
-
-        let haiku = lookup_droid_pricing("claude-haiku-4-5-20251001").expect("haiku 4.5 pricing");
-        assert!((haiku.input_per_mtok_usd - 4.0).abs() < 1e-12);
-        assert!((haiku.cache_read_per_mtok_usd - 0.4).abs() < 1e-12);
-
-        let opus_fast =
-            lookup_droid_pricing("claude-opus-4-6-fast").expect("opus 4.6 fast pricing");
-        assert!((opus_fast.input_per_mtok_usd - 120.0).abs() < 1e-12);
-
-        assert!(lookup_droid_pricing("mystery-model").is_none());
-        assert!(lookup_droid_pricing("<unknown>").is_none());
-    }
-
-    #[test]
-    fn droid_pricing_differs_from_api_pricing() {
-        let droid = lookup_droid_pricing("claude-opus-4-5-20251101").expect("droid pricing");
-        let api = lookup_model_pricing("claude-opus-4-5-20251101").expect("api pricing");
-
-        assert_ne!(droid.input_per_mtok_usd, api.input_per_mtok_usd);
-        assert_ne!(droid.output_per_mtok_usd, api.output_per_mtok_usd);
-    }
-
-    #[test]
-    fn droid_scanner_reads_settings_and_jsonl() {
-        let temp = tempdir().expect("create tempdir");
-        let droid_root = temp.path().join("sessions");
-        let session_dir = droid_root.join("-tmp-proj");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-
-        fs::write(
-            session_dir.join("abc.settings.json"),
-            r#"{"model":"claude-opus-4-5-20251101","tokenUsage":{"inputTokens":100,"outputTokens":50,"cacheCreationTokens":20,"cacheReadTokens":500,"thinkingTokens":10},"providerLockTimestamp":"2026-03-20T12:00:00Z"}"#,
-        )
-        .expect("write settings");
-
-        fs::write(
-            session_dir.join("abc.jsonl"),
-            "{\"type\":\"session_start\",\"cwd\":\"/tmp/proj\"}\n",
-        )
-        .expect("write jsonl");
-
-        let options = ScanOptions {
-            global: true,
-            root: PathBuf::from("/tmp/proj"),
-            codex_root: temp.path().join("missing"),
-            claude_root: temp.path().join("missing"),
-            droid_root,
-            parallel: false,
-            window: None,
-            ssh_hosts: Vec::new(),
-            selected_session: None,
-        };
-
-        let files = discover_settings_files(&options.droid_root);
-        assert_eq!(files.len(), 1);
-
-        let report = scan_droid_files(&files, &options);
-        assert_eq!(report.records_counted, 1);
-        assert_eq!(report.totals.input, 100);
-        assert_eq!(report.totals.output, 50);
-        assert_eq!(report.totals.cache_write, 20);
-        assert_eq!(report.totals.cache_read, 500);
-        assert_eq!(report.totals.thinking, 10);
-        assert!(report.model_usage.contains_key("claude-opus-4-5-20251101"));
-    }
-
-    #[test]
-    fn droid_scanner_filters_by_cwd_in_scoped_mode() {
-        let temp = tempdir().expect("create tempdir");
-        let droid_root = temp.path().join("sessions");
-        let session_dir = droid_root.join("-tmp-proj");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-
-        fs::write(
-            session_dir.join("abc.settings.json"),
-            r#"{"model":"claude-opus-4-5-20251101","tokenUsage":{"inputTokens":100,"outputTokens":50,"cacheCreationTokens":20,"cacheReadTokens":500,"thinkingTokens":10},"providerLockTimestamp":"2026-03-20T12:00:00Z"}"#,
-        )
-        .expect("write settings");
-
-        fs::write(
-            session_dir.join("abc.jsonl"),
-            "{\"type\":\"session_start\",\"cwd\":\"/tmp/other\"}\n",
-        )
-        .expect("write jsonl");
-
-        let files = discover_settings_files(&droid_root);
-        let report = scan_droid_files(
-            &files,
-            &ScanOptions {
-                global: false,
-                root: PathBuf::from("/tmp/proj"),
-                codex_root: temp.path().join("missing"),
-                claude_root: temp.path().join("missing"),
-                droid_root,
-                parallel: false,
-                window: None,
-                ssh_hosts: Vec::new(),
-                selected_session: None,
-            },
-        );
-
-        assert_eq!(report.records_counted, 0);
-        assert!(report.totals.is_zero());
-    }
-
-    #[test]
-    fn droid_scanner_filters_by_time_window() {
-        let temp = tempdir().expect("create tempdir");
-        let droid_root = temp.path().join("sessions");
-        let session_dir = droid_root.join("-tmp-proj");
-        fs::create_dir_all(&session_dir).expect("create session dir");
-
-        fs::write(
-            session_dir.join("old.settings.json"),
-            r#"{"model":"claude-opus-4-5-20251101","tokenUsage":{"inputTokens":100,"outputTokens":50,"cacheCreationTokens":0,"cacheReadTokens":0,"thinkingTokens":0},"providerLockTimestamp":"2026-03-01T00:00:00Z"}"#,
-        )
-        .expect("write old settings");
-        fs::write(
-            session_dir.join("old.jsonl"),
-            "{\"type\":\"session_start\",\"cwd\":\"/tmp/proj\"}\n",
-        )
-        .expect("write old jsonl");
-
-        fs::write(
-            session_dir.join("new.settings.json"),
-            r#"{"model":"claude-opus-4-5-20251101","tokenUsage":{"inputTokens":200,"outputTokens":30,"cacheCreationTokens":0,"cacheReadTokens":0,"thinkingTokens":0},"providerLockTimestamp":"2026-03-20T00:00:00Z"}"#,
-        )
-        .expect("write new settings");
-        fs::write(
-            session_dir.join("new.jsonl"),
-            "{\"type\":\"session_start\",\"cwd\":\"/tmp/proj\"}\n",
-        )
-        .expect("write new jsonl");
-
-        let cutoff_unix_ms = parse_rfc3339_unix_ms("2026-03-15T00:00:00Z").expect("parse cutoff");
-        let files = discover_settings_files(&droid_root);
-        let report = scan_droid_files(
-            &files,
-            &ScanOptions {
-                global: true,
-                root: PathBuf::from("/tmp/proj"),
-                codex_root: temp.path().join("missing"),
-                claude_root: temp.path().join("missing"),
-                droid_root,
-                parallel: false,
-                window: Some(TimeWindow {
-                    spec: "7d".to_string(),
-                    cutoff_unix_ms,
-                }),
-                ssh_hosts: Vec::new(),
-                selected_session: None,
-            },
-        );
-
-        assert_eq!(report.records_counted, 1);
-        assert_eq!(report.totals.input, 200);
-        assert_eq!(report.totals.output, 30);
     }
 
     #[test]
@@ -4105,7 +3408,6 @@ mod tests {
             root: PathBuf::from("/tmp/proj"),
             codex_root: PathBuf::from("missing"),
             claude_root: PathBuf::from("missing"),
-            droid_root: PathBuf::from("missing"),
             parallel: false,
             window: Some(TimeWindow {
                 spec: "7d".to_string(),
