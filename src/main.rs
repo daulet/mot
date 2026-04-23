@@ -1,12 +1,21 @@
 use clap::Parser;
 use mot::{
-    ScanOptions, SessionSummary, build_topbar_snapshot, collect_usage, list_session_summaries,
+    ScanOptions, SessionSummary, TopBarSnapshot, collect_usage, list_session_summaries,
     parse_time_window, render_report, resolve_scope_root, resolve_session_selection,
 };
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use time::{Date, Duration, Month, OffsetDateTime, Weekday};
 
+const ACTIVITY_CALENDAR_WEEKS: usize = 53;
+const ACTIVITY_CALENDAR_DAYS: usize = ACTIVITY_CALENDAR_WEEKS * 7;
+const ACTIVITY_CALENDAR_HEIGHT: usize = 10;
+const ACTIVITY_LABEL_WIDTH: usize = 4;
+const ACTIVITY_CELL: &str = "■";
 const SESSION_PICKER_VISIBLE_ROWS: usize = 12;
 
 #[derive(Debug, Parser)]
@@ -80,6 +89,9 @@ struct Cli {
     )]
     ssh_hosts: Vec<String>,
 
+    #[arg(long, help = "Hide the Ratatui activity calendar in table output")]
+    no_activity_calendar: bool,
+
     #[arg(long, value_name = "PATH", hide = true)]
     codex_root: Option<PathBuf>,
 
@@ -114,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let has_ssh_hosts = !cli.ssh_hosts.is_empty();
+    let show_activity_calendar = !cli.no_activity_calendar;
 
     let mut options = ScanOptions {
         global: cli.global,
@@ -165,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.topbar_json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&build_topbar_snapshot(&report, 7))?
+            serde_json::to_string_pretty(&mot::build_topbar_snapshot(&report, 7))?
         );
         return Ok(());
     }
@@ -176,7 +189,344 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     print!("{}", render_report(&report));
+    if show_activity_calendar {
+        render_activity_calendar(&report)?;
+    }
     Ok(())
+}
+
+fn render_activity_calendar(report: &mot::UsageReport) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    if !stdout.is_terminal() {
+        return Ok(());
+    }
+
+    let snapshot = mot::build_topbar_snapshot(report, ACTIVITY_CALENDAR_DAYS);
+    let lines = activity_calendar_lines(&snapshot, terminal_width() as u16);
+
+    writeln!(stdout)?;
+    write!(stdout, "{}", activity_lines_to_ansi(&lines))?;
+    stdout.flush()
+}
+
+fn activity_calendar_lines(snapshot: &TopBarSnapshot, width: u16) -> Vec<Line<'static>> {
+    let weeks = activity_calendar_visible_weeks(width);
+    let gap = activity_calendar_has_gap(width, weeks);
+    let today = OffsetDateTime::now_utc().date();
+    let start = activity_calendar_start_date(today, weeks);
+    let day_totals = activity_day_totals(snapshot);
+    let (active_days, total_tokens, max_tokens) =
+        activity_calendar_totals(start, today, weeks, &day_totals);
+
+    let mut lines = Vec::with_capacity(ACTIVITY_CALENDAR_HEIGHT);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "Activity calendar",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            " - last {weeks} weeks, {active_days} active days, {} tokens",
+            format_calendar_count(total_tokens)
+        )),
+    ]));
+    lines.push(activity_month_label_line(start, today, weeks, gap));
+    for row in 0..7 {
+        lines.push(activity_day_row(
+            row,
+            start,
+            today,
+            weeks,
+            gap,
+            &day_totals,
+            max_tokens,
+        ));
+    }
+    lines.push(activity_legend_line(max_tokens, gap));
+
+    lines
+}
+
+fn activity_lines_to_ansi(lines: &[Line<'_>]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        for span in &line.spans {
+            let styled = push_ansi_style(&mut out, span.style);
+            out.push_str(span.content.as_ref());
+            if styled {
+                out.push_str("\x1b[0m");
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn push_ansi_style(out: &mut String, style: Style) -> bool {
+    let mut codes = Vec::new();
+    if style.add_modifier.contains(Modifier::BOLD) {
+        codes.push("1".to_string());
+    }
+    if let Some(fg) = style.fg
+        && let Some(code) = ansi_fg_code(fg)
+    {
+        codes.push(code);
+    }
+
+    if codes.is_empty() {
+        return false;
+    }
+
+    out.push_str("\x1b[");
+    out.push_str(&codes.join(";"));
+    out.push('m');
+    true
+}
+
+fn ansi_fg_code(color: Color) -> Option<String> {
+    match color {
+        Color::Black => Some("30".to_string()),
+        Color::Red => Some("31".to_string()),
+        Color::Green => Some("32".to_string()),
+        Color::Yellow => Some("33".to_string()),
+        Color::Blue => Some("34".to_string()),
+        Color::Magenta => Some("35".to_string()),
+        Color::Cyan => Some("36".to_string()),
+        Color::Gray => Some("37".to_string()),
+        Color::DarkGray => Some("90".to_string()),
+        Color::LightRed => Some("91".to_string()),
+        Color::LightGreen => Some("92".to_string()),
+        Color::LightYellow => Some("93".to_string()),
+        Color::LightBlue => Some("94".to_string()),
+        Color::LightMagenta => Some("95".to_string()),
+        Color::LightCyan => Some("96".to_string()),
+        Color::White => Some("97".to_string()),
+        Color::Rgb(r, g, b) => Some(format!("38;2;{r};{g};{b}")),
+        Color::Indexed(index) => Some(format!("38;5;{index}")),
+        Color::Reset => None,
+    }
+}
+
+fn activity_day_totals(snapshot: &TopBarSnapshot) -> HashMap<Date, u64> {
+    snapshot
+        .days
+        .iter()
+        .filter_map(|day| Some((date_from_day_key(&day.day)?, day.total_tokens)))
+        .collect()
+}
+
+fn activity_calendar_totals(
+    start: Date,
+    today: Date,
+    weeks: usize,
+    day_totals: &HashMap<Date, u64>,
+) -> (usize, u64, u64) {
+    let mut active_days = 0usize;
+    let mut total_tokens = 0u64;
+    let mut max_tokens = 0u64;
+
+    for offset in 0..weeks * 7 {
+        let date = start + Duration::days(offset as i64);
+        if date > today {
+            continue;
+        }
+
+        let tokens = day_totals.get(&date).copied().unwrap_or(0);
+        if tokens > 0 {
+            active_days += 1;
+            total_tokens += tokens;
+            max_tokens = max_tokens.max(tokens);
+        }
+    }
+
+    (active_days, total_tokens, max_tokens)
+}
+
+fn activity_calendar_visible_weeks(width: u16) -> usize {
+    let available = usize::from(width).saturating_sub(ACTIVITY_LABEL_WIDTH);
+    let cell_width = if available >= ACTIVITY_CALENDAR_WEEKS * 2 {
+        2
+    } else {
+        1
+    };
+    (available / cell_width).clamp(1, ACTIVITY_CALENDAR_WEEKS)
+}
+
+fn activity_calendar_has_gap(width: u16, weeks: usize) -> bool {
+    usize::from(width).saturating_sub(ACTIVITY_LABEL_WIDTH) >= weeks * 2
+}
+
+fn activity_calendar_start_date(today: Date, weeks: usize) -> Date {
+    let day_offset = (weeks.saturating_sub(1) * 7) + weekday_index_sunday_start(today.weekday());
+    today - Duration::days(day_offset as i64)
+}
+
+fn activity_month_label_line(start: Date, today: Date, weeks: usize, gap: bool) -> Line<'static> {
+    let cell_width = if gap { 2 } else { 1 };
+    let mut chars = vec![' '; weeks * cell_width];
+
+    for offset in 0..weeks * 7 {
+        let date = start + Duration::days(offset as i64);
+        if date > today {
+            break;
+        }
+        if date.day() == 1 {
+            let col = offset / 7;
+            place_month_label(&mut chars, col * cell_width, month_abbrev(date.month()));
+        }
+    }
+
+    let mut line = String::from("    ");
+    line.extend(chars);
+    Line::raw(line)
+}
+
+fn place_month_label(chars: &mut [char], position: usize, label: &str) {
+    for (idx, ch) in label.chars().enumerate() {
+        if let Some(slot) = chars.get_mut(position + idx) {
+            *slot = ch;
+        }
+    }
+}
+
+fn activity_day_row(
+    row: usize,
+    start: Date,
+    today: Date,
+    weeks: usize,
+    gap: bool,
+    day_totals: &HashMap<Date, u64>,
+    max_tokens: u64,
+) -> Line<'static> {
+    let mut spans = Vec::with_capacity(1 + weeks * if gap { 2 } else { 1 });
+    spans.push(Span::raw(weekday_label(row)));
+
+    for week in 0..weeks {
+        let date = start + Duration::days((week * 7 + row) as i64);
+        if date > today {
+            spans.push(Span::raw(" "));
+        } else {
+            let tokens = day_totals.get(&date).copied().unwrap_or(0);
+            spans.push(activity_cell_span(tokens, max_tokens));
+        }
+        if gap {
+            spans.push(Span::raw(" "));
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn activity_cell_span(tokens: u64, max_tokens: u64) -> Span<'static> {
+    if tokens == 0 {
+        Span::styled(ACTIVITY_CELL, Style::default().fg(Color::Rgb(48, 54, 61)))
+    } else {
+        Span::styled(
+            ACTIVITY_CELL,
+            activity_level_style(activity_level_for_tokens(tokens, max_tokens)),
+        )
+    }
+}
+
+fn activity_legend_line(max_tokens: u64, gap: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw("    Less ")];
+    for level in 1..=4 {
+        spans.push(Span::styled(ACTIVITY_CELL, activity_level_style(level)));
+        spans.push(Span::raw(if gap { "  " } else { " " }));
+    }
+    spans.push(Span::raw("More"));
+    if max_tokens == 0 {
+        spans.push(Span::raw(" (no timestamped activity)"));
+    }
+    Line::from(spans)
+}
+
+fn activity_level_for_tokens(tokens: u64, max_tokens: u64) -> u8 {
+    if tokens == 0 || max_tokens == 0 {
+        return 0;
+    }
+
+    let ratio = (tokens as f64).ln_1p() / (max_tokens as f64).ln_1p();
+    if ratio < 0.25 {
+        1
+    } else if ratio < 0.5 {
+        2
+    } else if ratio < 0.75 {
+        3
+    } else {
+        4
+    }
+}
+
+fn activity_level_style(level: u8) -> Style {
+    let color = match level {
+        1 => Color::Rgb(155, 233, 168),
+        2 => Color::Rgb(63, 185, 80),
+        3 => Color::Rgb(35, 134, 54),
+        _ => Color::Rgb(12, 84, 33),
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn weekday_label(row: usize) -> &'static str {
+    match row {
+        1 => "Mon ",
+        3 => "Wed ",
+        5 => "Fri ",
+        _ => "    ",
+    }
+}
+
+fn weekday_index_sunday_start(weekday: Weekday) -> usize {
+    match weekday {
+        Weekday::Sunday => 0,
+        Weekday::Monday => 1,
+        Weekday::Tuesday => 2,
+        Weekday::Wednesday => 3,
+        Weekday::Thursday => 4,
+        Weekday::Friday => 5,
+        Weekday::Saturday => 6,
+    }
+}
+
+fn month_abbrev(month: Month) -> &'static str {
+    match month {
+        Month::January => "Jan",
+        Month::February => "Feb",
+        Month::March => "Mar",
+        Month::April => "Apr",
+        Month::May => "May",
+        Month::June => "Jun",
+        Month::July => "Jul",
+        Month::August => "Aug",
+        Month::September => "Sep",
+        Month::October => "Oct",
+        Month::November => "Nov",
+        Month::December => "Dec",
+    }
+}
+
+fn date_from_day_key(day: &str) -> Option<Date> {
+    let mut parts = day.split('-');
+    let year = parts.next()?.parse().ok()?;
+    let month = Month::try_from(parts.next()?.parse::<u8>().ok()?).ok()?;
+    let day = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Date::from_calendar_date(year, month, day).ok()
+}
+
+fn format_calendar_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let len = digits.len();
+    for (i, ch) in digits.chars().enumerate() {
+        if i != 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn select_session_interactively(
@@ -641,6 +991,13 @@ mod tests {
     }
 
     #[test]
+    fn no_activity_calendar_flag_is_collected() {
+        let parsed = Cli::try_parse_from(["mot", "--no-activity-calendar"])
+            .expect("parse no activity calendar");
+        assert!(parsed.no_activity_calendar);
+    }
+
+    #[test]
     fn picker_line_fitting_truncates_to_width() {
         let fitted = super::fit_terminal_line("abcdefghijklmnopqrstuvwxyz", 10);
         assert_eq!(fitted, "abcdefg...");
@@ -674,5 +1031,33 @@ mod tests {
         assert!(frame.lines.len() <= 8);
         assert_eq!(frame.selected_line, 7);
         assert!(frame.lines.iter().all(|line| line.chars().count() <= 39));
+    }
+
+    #[test]
+    fn activity_calendar_start_aligns_to_sunday() {
+        let today =
+            time::Date::from_calendar_date(2026, time::Month::April, 22).expect("valid date");
+        let start = super::activity_calendar_start_date(today, 2);
+
+        assert_eq!(start.weekday(), time::Weekday::Sunday);
+        assert_eq!(
+            start,
+            time::Date::from_calendar_date(2026, time::Month::April, 12).expect("valid date")
+        );
+    }
+
+    #[test]
+    fn activity_calendar_level_increases_with_log_scaled_usage() {
+        assert_eq!(super::activity_level_for_tokens(0, 100), 0);
+        assert_eq!(super::activity_level_for_tokens(1, 1_000_000), 1);
+        assert_eq!(super::activity_level_for_tokens(100, 1_000_000), 2);
+        assert_eq!(super::activity_level_for_tokens(10_000, 1_000_000), 3);
+        assert_eq!(super::activity_level_for_tokens(1_000_000, 1_000_000), 4);
+    }
+
+    #[test]
+    fn activity_calendar_cells_use_square_glyphs() {
+        assert_eq!(super::activity_cell_span(0, 100).content.as_ref(), "■");
+        assert_eq!(super::activity_cell_span(10, 100).content.as_ref(), "■");
     }
 }

@@ -10,6 +10,7 @@ mot --global # aggregation across all local sessions
 mot --window 7d # only count tokens in last week
 mot --session 019d8e7f # only count one local session by id, id prefix, file name, or path
 mot --select-session # choose a scoped local session with an arrow-key picker
+mot --no-activity-calendar # hide the Ratatui activity calendar
 mot --global --since 1m # all sessions, only count tokens in past month
 mot --global --ssh-host vm-a --ssh-host vm-b # include remote VM sessions over SSH
 ```
@@ -34,6 +35,18 @@ Claude     claude-haiku-4-5-20251001             8,723            168           
 Claude     claude-opus-4-6                           4            477              0         21,124         21,501        $0.1569
 Droid      claude-opus-4-5-20251101                493         48,106          4,117     13,176,535        747,883         $16.83
 ```
+
+When stdout is an interactive terminal, table output also renders a GitHub-style
+Ratatui activity calendar for the last 53 weeks. Squares are shaded by daily
+token activity. Activity days come from the same timestamped usage records as
+the daily rollups:
+
+- Codex: token-count event deltas are assigned to each event timestamp, so a
+  session that spans multiple days contributes to each active day.
+- Claude: assistant responses are deduplicated by request/message id, then
+  assigned to their response timestamp.
+- Droid: Factory settings expose aggregate session token usage, so activity is
+  assigned to `providerLockTimestamp`.
 
 ## Install
 
