@@ -2514,8 +2514,10 @@ fn build_remote_mot_script(options: &ScanOptions) -> String {
         args.push("--window".to_string());
         args.push(window.spec.clone());
     }
-    args.push("--activity-timezone-offset-seconds".to_string());
-    args.push(options.activity_timezone_offset_seconds.to_string());
+    args.push(format!(
+        "--activity-timezone-offset-seconds={}",
+        options.activity_timezone_offset_seconds
+    ));
     let command = args
         .iter()
         .map(|arg| shell_single_quote(arg))
@@ -3720,11 +3722,13 @@ mod tests {
             }),
             ssh_hosts: Vec::new(),
             selected_session: None,
-            activity_timezone_offset_seconds: 0,
+            activity_timezone_offset_seconds: -7 * 60 * 60,
         });
 
         assert!(script.contains("command -v mot"));
-        assert!(script.contains("'mot' '--json' '--root' '/tmp/proj' '--window' '7d' '--activity-timezone-offset-seconds' '0'"));
+        assert!(script.contains(
+            "'mot' '--json' '--root' '/tmp/proj' '--window' '7d' '--activity-timezone-offset-seconds=-25200'"
+        ));
     }
 
     #[test]

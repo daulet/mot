@@ -154,7 +154,7 @@ struct Cli {
     #[arg(long, value_name = "PATH", hide = true)]
     claude_root: Option<PathBuf>,
 
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, allow_hyphen_values = true)]
     activity_timezone_offset_seconds: Option<i32>,
 }
 
@@ -1419,6 +1419,13 @@ mod tests {
         let parsed = Cli::try_parse_from(["mot", "--no-activity-calendar"])
             .expect("parse no activity calendar");
         assert!(parsed.no_activity_calendar);
+    }
+
+    #[test]
+    fn hidden_activity_timezone_offset_accepts_negative_values() {
+        let parsed = Cli::try_parse_from(["mot", "--activity-timezone-offset-seconds", "-25200"])
+            .expect("parse negative timezone offset");
+        assert_eq!(parsed.activity_timezone_offset_seconds, Some(-25_200));
     }
 
     #[test]
