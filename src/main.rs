@@ -13,7 +13,7 @@ use time::{Date, Duration, Month, OffsetDateTime, Weekday};
 
 const ACTIVITY_CALENDAR_WEEKS: usize = 53;
 const ACTIVITY_CALENDAR_DAYS: usize = ACTIVITY_CALENDAR_WEEKS * 7;
-const ACTIVITY_CALENDAR_HEIGHT: usize = 10;
+const ACTIVITY_CALENDAR_HEIGHT: usize = 11;
 const ACTIVITY_LABEL_WIDTH: usize = 4;
 const ACTIVITY_CELL: &str = "■";
 const SESSION_PICKER_VISIBLE_ROWS: usize = 12;
@@ -217,6 +217,7 @@ fn activity_calendar_lines(snapshot: &TopBarSnapshot, width: u16) -> Vec<Line<'s
     let day_totals = activity_day_totals(snapshot);
     let (active_days, total_tokens, max_tokens) =
         activity_calendar_totals(start, today, weeks, &day_totals);
+    let streaks = activity_streaks(start, today, weeks, &day_totals);
 
     let mut lines = Vec::with_capacity(ACTIVITY_CALENDAR_HEIGHT);
     lines.push(Line::from(vec![
@@ -242,6 +243,7 @@ fn activity_calendar_lines(snapshot: &TopBarSnapshot, width: u16) -> Vec<Line<'s
         ));
     }
     lines.push(activity_legend_line(max_tokens, gap));
+    lines.push(activity_streak_line(streaks));
 
     lines
 }
@@ -341,6 +343,45 @@ fn activity_calendar_totals(
     (active_days, total_tokens, max_tokens)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActivityStreaks {
+    current: usize,
+    longest: usize,
+}
+
+fn activity_streaks(
+    start: Date,
+    today: Date,
+    weeks: usize,
+    day_totals: &HashMap<Date, u64>,
+) -> ActivityStreaks {
+    let mut longest = 0usize;
+    let mut running = 0usize;
+    let mut current = 0usize;
+
+    for offset in 0..weeks * 7 {
+        let date = start + Duration::days(offset as i64);
+        if date > today {
+            break;
+        }
+
+        if day_totals.get(&date).copied().unwrap_or(0) > 0 {
+            running += 1;
+            longest = longest.max(running);
+            if date == today {
+                current = running;
+            }
+        } else {
+            running = 0;
+            if date == today {
+                current = 0;
+            }
+        }
+    }
+
+    ActivityStreaks { current, longest }
+}
+
 fn activity_calendar_visible_weeks(width: u16) -> usize {
     let available = usize::from(width).saturating_sub(ACTIVITY_LABEL_WIDTH);
     let cell_width = if available >= ACTIVITY_CALENDAR_WEEKS * 2 {
@@ -438,6 +479,20 @@ fn activity_legend_line(max_tokens: u64, gap: bool) -> Line<'static> {
         spans.push(Span::raw(" (no timestamped activity)"));
     }
     Line::from(spans)
+}
+
+fn activity_streak_line(streaks: ActivityStreaks) -> Line<'static> {
+    Line::from(vec![Span::raw(format!(
+        "    Current streak: {} {}, Longest streak: {} {}",
+        streaks.current,
+        plural_days(streaks.current),
+        streaks.longest,
+        plural_days(streaks.longest)
+    ))])
+}
+
+fn plural_days(days: usize) -> &'static str {
+    if days == 1 { "day" } else { "days" }
 }
 
 fn activity_level_for_tokens(tokens: u64, max_tokens: u64) -> u8 {
@@ -1059,5 +1114,40 @@ mod tests {
     fn activity_calendar_cells_use_square_glyphs() {
         assert_eq!(super::activity_cell_span(0, 100).content.as_ref(), "■");
         assert_eq!(super::activity_cell_span(10, 100).content.as_ref(), "■");
+    }
+
+    #[test]
+    fn activity_streaks_report_current_and_longest_runs() {
+        let start =
+            time::Date::from_calendar_date(2026, time::Month::April, 12).expect("valid date");
+        let today =
+            time::Date::from_calendar_date(2026, time::Month::April, 22).expect("valid date");
+        let mut day_totals = std::collections::HashMap::new();
+        day_totals.insert(start, 1);
+        day_totals.insert(start + time::Duration::days(1), 1);
+        day_totals.insert(start + time::Duration::days(2), 1);
+        day_totals.insert(today - time::Duration::days(1), 1);
+        day_totals.insert(today, 1);
+
+        let streaks = super::activity_streaks(start, today, 2, &day_totals);
+
+        assert_eq!(streaks.current, 2);
+        assert_eq!(streaks.longest, 3);
+    }
+
+    #[test]
+    fn activity_streaks_current_is_zero_when_today_is_inactive() {
+        let start =
+            time::Date::from_calendar_date(2026, time::Month::April, 12).expect("valid date");
+        let today =
+            time::Date::from_calendar_date(2026, time::Month::April, 22).expect("valid date");
+        let mut day_totals = std::collections::HashMap::new();
+        day_totals.insert(today - time::Duration::days(2), 1);
+        day_totals.insert(today - time::Duration::days(1), 1);
+
+        let streaks = super::activity_streaks(start, today, 2, &day_totals);
+
+        assert_eq!(streaks.current, 0);
+        assert_eq!(streaks.longest, 2);
     }
 }
