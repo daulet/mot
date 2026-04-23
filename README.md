@@ -60,12 +60,23 @@ one token is roughly three quarters of a word.
 ## Install
 
 ```bash
-# Homebrew
+# Linux/macOS quick install
+curl -fsSL https://github.com/daulet/mot/releases/latest/download/install.sh | sh
+
+# Ubuntu/Debian package install
+curl -fsSL https://github.com/daulet/mot/releases/latest/download/install.sh | sh -s -- --deb
+
+# Homebrew on macOS
 brew install daulet/tap/mot
 
 # From source (latest main)
 cargo install --git https://github.com/daulet/mot
 ```
+
+Linux release artifacts include `x86_64-unknown-linux-gnu` builds produced on
+Ubuntu 22.04, matching Ubuntu 22.04 x86_64 VMs, plus `aarch64-unknown-linux-gnu`
+for ARM Linux hosts. The quick installer verifies `checksums.txt` before
+installing.
 
 ## Remote VMs
 
@@ -78,6 +89,7 @@ mot --all --host user@vm-a --host user@vm-b
 Notes:
 
 - Remote scanning reads the same default directories as local mode: `~/.codex/sessions` and `~/.claude/projects`.
+- To bootstrap a Linux remote, run `curl -fsSL https://github.com/daulet/mot/releases/latest/download/install.sh | sh` on that host.
 - It shells out to local `ssh` and runs `mot --json` on the remote host, so `mot` must be installed remotely and available in `PATH`.
 - Remote activity stats are requested with the caller's local timezone offset so calendar days, streaks, and peak hour use one shared boundary before reports are merged.
 - If a remote host has an older/incompatible `mot` (or missing `mot`), that host is skipped and surfaced in `Warnings` output.
