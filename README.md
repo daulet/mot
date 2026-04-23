@@ -52,6 +52,10 @@ Table output also includes a randomly selected book-scale comparison. Book word
 counts are converted to estimated tokens using the English rule of thumb that
 one token is roughly three quarters of a word.
 
+The calendar stats include a peak hour computed from Codex and Claude
+timestamped usage records. Droid is excluded because its available usage is
+session-aggregate metadata.
+
 ## Install
 
 ```bash

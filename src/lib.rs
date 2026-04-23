@@ -164,6 +164,8 @@ pub struct ProviderReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily: Vec<DailyReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hourly: Vec<HourlyReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub by_host: Vec<HostReport>,
     #[serde(default)]
     pub by_model: Vec<ModelReport>,
@@ -171,6 +173,8 @@ pub struct ProviderReport {
     model_usage: HashMap<String, ModelUsage>,
     #[serde(skip)]
     day_model_usage: HashMap<String, HashMap<String, ModelUsage>>,
+    #[serde(skip)]
+    hour_model_usage: HashMap<u8, HashMap<String, ModelUsage>>,
     #[serde(skip)]
     host_model_usage: HashMap<String, HashMap<String, ModelUsage>>,
 }
@@ -208,6 +212,19 @@ impl std::ops::AddAssign for ProviderReport {
             let day_entry = self.day_model_usage.entry(day).or_default();
             for (model, usage) in usage_by_model {
                 day_entry
+                    .entry(model)
+                    .and_modify(|existing| {
+                        existing.records_counted += usage.records_counted;
+                        existing.totals += usage.totals;
+                    })
+                    .or_insert(usage);
+            }
+        }
+
+        for (hour, usage_by_model) in rhs.hour_model_usage {
+            let hour_entry = self.hour_model_usage.entry(hour).or_default();
+            for (model, usage) in usage_by_model {
+                hour_entry
                     .entry(model)
                     .and_modify(|existing| {
                         existing.records_counted += usage.records_counted;
@@ -759,6 +776,7 @@ fn finalize_provider_pricing_with(
     report.unpriced_records_counted = 0;
     report.unpriced_models.clear();
     report.daily.clear();
+    report.hourly.clear();
     report.by_host.clear();
     report.by_model.clear();
 
@@ -797,6 +815,7 @@ fn finalize_provider_pricing_with(
     report.by_model = by_model;
     report.by_host = build_host_reports(&report.host_model_usage, lookup);
     report.daily = build_daily_reports(&report.day_model_usage, lookup);
+    report.hourly = build_hourly_reports(&report.hour_model_usage, lookup);
 }
 
 fn model_report_sort(a: &ModelReport, b: &ModelReport) -> Ordering {
@@ -861,6 +880,37 @@ fn build_daily_reports(
 
     daily.sort_by(|a, b| a.day.cmp(&b.day));
     daily
+}
+
+fn build_hourly_reports(
+    hour_model_usage: &HashMap<u8, HashMap<String, ModelUsage>>,
+    lookup: fn(&str) -> Option<ModelPricing>,
+) -> Vec<HourlyReport> {
+    let mut hourly = Vec::with_capacity(hour_model_usage.len());
+
+    for (&hour, usage_by_model) in hour_model_usage {
+        let mut records_counted = 0usize;
+        let mut totals = TokenTotals::default();
+        let mut estimated_cost_usd = 0.0;
+
+        for (model, usage) in usage_by_model {
+            records_counted += usage.records_counted;
+            totals += usage.totals;
+            if let Some(pricing) = lookup(model) {
+                estimated_cost_usd += estimate_cost_usd(usage.totals, pricing);
+            }
+        }
+
+        hourly.push(HourlyReport {
+            hour,
+            records_counted,
+            totals,
+            estimated_cost_usd,
+        });
+    }
+
+    hourly.sort_by(|a, b| a.hour.cmp(&b.hour));
+    hourly
 }
 
 fn build_host_reports(
@@ -982,11 +1032,13 @@ fn merge_remote_host_reports(report: &mut UsageReport, options: &ScanOptions) {
 fn merge_provider_report(dst: &mut ProviderReport, mut src: ProviderReport) {
     let src_by_model = std::mem::take(&mut src.by_model);
     let src_daily = std::mem::take(&mut src.daily);
+    let src_hourly = std::mem::take(&mut src.hourly);
     let src_by_host = std::mem::take(&mut src.by_host);
 
     *dst += src;
     merge_model_reports(&mut dst.by_model, src_by_model);
     merge_daily_reports(&mut dst.daily, src_daily);
+    merge_hourly_reports(&mut dst.hourly, src_hourly);
     merge_host_reports(&mut dst.by_host, src_by_host);
     dst.unpriced_models.sort();
 }
@@ -1044,6 +1096,29 @@ fn merge_daily_reports(dst: &mut Vec<DailyReport>, src: Vec<DailyReport>) {
     }
 
     dst.sort_by(|a, b| a.day.cmp(&b.day));
+}
+
+fn merge_hourly_reports(dst: &mut Vec<HourlyReport>, src: Vec<HourlyReport>) {
+    let mut index_by_hour: HashMap<u8, usize> = dst
+        .iter()
+        .enumerate()
+        .map(|(idx, hour)| (hour.hour, idx))
+        .collect();
+
+    for entry in src {
+        if let Some(&idx) = index_by_hour.get(&entry.hour) {
+            let existing = &mut dst[idx];
+            existing.records_counted += entry.records_counted;
+            existing.totals += entry.totals;
+            existing.estimated_cost_usd += entry.estimated_cost_usd;
+        } else {
+            let next_index = dst.len();
+            index_by_hour.insert(entry.hour, next_index);
+            dst.push(entry);
+        }
+    }
+
+    dst.sort_by(|a, b| a.hour.cmp(&b.hour));
 }
 
 fn merge_host_reports(dst: &mut Vec<HostReport>, src: Vec<HostReport>) {
@@ -1399,6 +1474,12 @@ fn timestamp_day_key(timestamp: Option<&str>) -> Option<String> {
     let timestamp = timestamp?;
     let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
     Some(day_key_from_date(parsed.date()))
+}
+
+fn timestamp_hour_key(timestamp: Option<&str>) -> Option<u8> {
+    let timestamp = timestamp?;
+    let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
+    Some(parsed.hour())
 }
 
 fn day_key_from_date(date: Date) -> String {
@@ -2099,6 +2180,7 @@ fn parse_codex_reader<R: BufRead>(
     let mut session_totals = TokenTotals::default();
     let mut by_model: HashMap<String, ModelUsage> = HashMap::new();
     let mut day_model_usage: HashMap<String, HashMap<String, ModelUsage>> = HashMap::new();
+    let mut hour_model_usage: HashMap<u8, HashMap<String, ModelUsage>> = HashMap::new();
     let mut host_model_usage: HashMap<String, HashMap<String, ModelUsage>> = HashMap::new();
     let mut saw_usage = false;
 
@@ -2172,7 +2254,7 @@ fn parse_codex_reader<R: BufRead>(
                                     .as_deref()
                                     .unwrap_or(UNKNOWN_MODEL)
                                     .to_string();
-                                by_model.entry(model).or_default().add_record(delta);
+                                by_model.entry(model.clone()).or_default().add_record(delta);
                                 host_model_usage
                                     .entry(host_label.to_string())
                                     .or_default()
@@ -2190,12 +2272,17 @@ fn parse_codex_reader<R: BufRead>(
                                     day_model_usage
                                         .entry(day_key)
                                         .or_default()
-                                        .entry(
-                                            current_model
-                                                .as_deref()
-                                                .unwrap_or(UNKNOWN_MODEL)
-                                                .to_string(),
-                                        )
+                                        .entry(model.clone())
+                                        .or_default()
+                                        .add_record(delta);
+                                }
+                                if let Some(hour_key) =
+                                    timestamp_hour_key(parsed.timestamp.as_deref())
+                                {
+                                    hour_model_usage
+                                        .entry(hour_key)
+                                        .or_default()
+                                        .entry(model)
                                         .or_default()
                                         .add_record(delta);
                                 }
@@ -2230,6 +2317,7 @@ fn parse_codex_reader<R: BufRead>(
     report.totals = session_totals;
     report.model_usage = by_model;
     report.day_model_usage = day_model_usage;
+    report.hour_model_usage = hour_model_usage;
     report.host_model_usage = host_model_usage;
     report
 }
@@ -2321,6 +2409,7 @@ fn parse_claude_reader<R: BufRead>(
                         }
 
                         let day_key = timestamp_day_key(parsed.timestamp.as_deref());
+                        let hour_key = timestamp_hour_key(parsed.timestamp.as_deref());
                         let model = model.unwrap_or_else(|| UNKNOWN_MODEL.to_string());
 
                         let key = parsed
@@ -2339,9 +2428,13 @@ fn parse_claude_reader<R: BufRead>(
                                 if existing.day_key.is_none() {
                                     existing.day_key = day_key.clone();
                                 }
+                                if existing.hour_key.is_none() {
+                                    existing.hour_key = hour_key;
+                                }
                             })
                             .or_insert(ClaudeRequestUsage {
                                 day_key,
+                                hour_key,
                                 model,
                                 totals,
                             });
@@ -2359,11 +2452,13 @@ fn parse_claude_reader<R: BufRead>(
     report.records_counted = by_request.len();
     let mut by_model: HashMap<String, ModelUsage> = HashMap::new();
     let mut day_model_usage: HashMap<String, HashMap<String, ModelUsage>> = HashMap::new();
+    let mut hour_model_usage: HashMap<u8, HashMap<String, ModelUsage>> = HashMap::new();
     let mut totals = TokenTotals::default();
 
     for usage in by_request.into_values() {
         totals += usage.totals;
         let day_key = usage.day_key;
+        let hour_key = usage.hour_key;
         let model = usage.model;
         by_model
             .entry(model.clone())
@@ -2380,6 +2475,14 @@ fn parse_claude_reader<R: BufRead>(
             day_model_usage
                 .entry(day_key)
                 .or_default()
+                .entry(model.clone())
+                .or_default()
+                .add_record(usage.totals);
+        }
+        if let Some(hour_key) = hour_key {
+            hour_model_usage
+                .entry(hour_key)
+                .or_default()
                 .entry(model)
                 .or_default()
                 .add_record(usage.totals);
@@ -2389,6 +2492,7 @@ fn parse_claude_reader<R: BufRead>(
     report.totals = totals;
     report.model_usage = by_model;
     report.day_model_usage = day_model_usage;
+    report.hour_model_usage = hour_model_usage;
     report
 }
 
@@ -2673,6 +2777,7 @@ struct ClaudeMessage {
 #[derive(Debug)]
 struct ClaudeRequestUsage {
     day_key: Option<String>,
+    hour_key: Option<u8>,
     model: String,
     totals: TokenTotals,
 }
@@ -3213,6 +3318,76 @@ mod tests {
     }
 
     #[test]
+    fn hourly_rollups_use_codex_and_claude_timestamps() {
+        let temp = tempdir().expect("create tempdir");
+
+        let codex_root = temp.path().join("codex");
+        fs::create_dir_all(&codex_root).expect("create codex root");
+        fs::write(
+            codex_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/tmp/proj\",\"model\":\"gpt-5.2-codex\"}}\n",
+                "{\"timestamp\":\"2026-03-20T09:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":2}}}}\n",
+                "{\"timestamp\":\"2026-03-20T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":150,\"cached_input_tokens\":10,\"output_tokens\":9,\"reasoning_output_tokens\":2}}}}\n"
+            ),
+        )
+        .expect("write codex session");
+
+        let claude_root = temp.path().join("claude/projects/test");
+        fs::create_dir_all(&claude_root).expect("create claude root");
+        fs::write(
+            claude_root.join("session.jsonl"),
+            "{\"timestamp\":\"2026-03-20T10:30:00Z\",\"type\":\"assistant\",\"cwd\":\"/tmp/proj\",\"requestId\":\"req1\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"m1\",\"usage\":{\"input_tokens\":50,\"output_tokens\":10,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":2}}}\n",
+        )
+        .expect("write claude session");
+
+        let options = ScanOptions {
+            global: true,
+            root: PathBuf::from("/tmp/proj"),
+            codex_root,
+            claude_root: temp.path().join("claude/projects"),
+            droid_root: temp.path().join("missing"),
+            parallel: false,
+            window: None,
+            ssh_hosts: Vec::new(),
+            selected_session: None,
+        };
+
+        let report = collect_usage(&options);
+
+        assert_eq!(report.codex.hourly.len(), 2);
+        assert_eq!(
+            report
+                .codex
+                .hourly
+                .iter()
+                .find(|hour| hour.hour == 9)
+                .map(|hour| hour.totals.total_tokens()),
+            Some(105)
+        );
+        assert_eq!(
+            report
+                .codex
+                .hourly
+                .iter()
+                .find(|hour| hour.hour == 10)
+                .map(|hour| hour.totals.total_tokens()),
+            Some(54)
+        );
+        assert_eq!(
+            report
+                .claude
+                .hourly
+                .iter()
+                .find(|hour| hour.hour == 10)
+                .map(|hour| hour.totals.total_tokens()),
+            Some(67)
+        );
+        assert!(report.droid.hourly.is_empty());
+    }
+
+    #[test]
     fn unknown_models_are_tracked_as_unpriced() {
         let temp = tempdir().expect("create tempdir");
         let codex_root = temp.path().join("codex");
@@ -3620,6 +3795,16 @@ mod tests {
                 },
                 estimated_cost_usd: 1.0,
             }],
+            hourly: vec![HourlyReport {
+                hour: 9,
+                records_counted: 1,
+                totals: TokenTotals {
+                    input: 10,
+                    output: 1,
+                    ..TokenTotals::default()
+                },
+                estimated_cost_usd: 1.0,
+            }],
             by_host: vec![HostReport {
                 host: "local".to_string(),
                 records_counted: 1,
@@ -3681,6 +3866,16 @@ mod tests {
                 },
                 estimated_cost_usd: 3.0,
             }],
+            hourly: vec![HourlyReport {
+                hour: 9,
+                records_counted: 2,
+                totals: TokenTotals {
+                    input: 30,
+                    output: 3,
+                    ..TokenTotals::default()
+                },
+                estimated_cost_usd: 3.0,
+            }],
             by_host: vec![HostReport {
                 host: "vm-a".to_string(),
                 records_counted: 2,
@@ -3708,6 +3903,8 @@ mod tests {
         );
         assert_eq!(local.daily.len(), 1);
         assert_eq!(local.daily[0].totals.input, 40);
+        assert_eq!(local.hourly.len(), 1);
+        assert_eq!(local.hourly[0].totals.input, 40);
         assert_eq!(local.by_host.len(), 2);
     }
 

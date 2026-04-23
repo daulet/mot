@@ -13,7 +13,7 @@ use time::{Date, Duration, Month, OffsetDateTime, Weekday};
 
 const ACTIVITY_CALENDAR_WEEKS: usize = 53;
 const ACTIVITY_CALENDAR_DAYS: usize = ACTIVITY_CALENDAR_WEEKS * 7;
-const ACTIVITY_CALENDAR_HEIGHT: usize = 12;
+const ACTIVITY_CALENDAR_HEIGHT: usize = 13;
 const ACTIVITY_LABEL_WIDTH: usize = 4;
 const ACTIVITY_CELL: &str = "■";
 const WORDS_PER_TOKEN_ESTIMATE: f64 = 0.75;
@@ -251,14 +251,19 @@ fn render_activity_calendar(report: &mot::UsageReport) -> io::Result<()> {
     }
 
     let snapshot = mot::build_topbar_snapshot(report, ACTIVITY_CALENDAR_DAYS);
-    let lines = activity_calendar_lines(&snapshot, terminal_width() as u16);
+    let peak_hour = peak_hour_from_report(report);
+    let lines = activity_calendar_lines(&snapshot, terminal_width() as u16, peak_hour);
 
     writeln!(stdout)?;
     write!(stdout, "{}", activity_lines_to_ansi(&lines))?;
     stdout.flush()
 }
 
-fn activity_calendar_lines(snapshot: &TopBarSnapshot, width: u16) -> Vec<Line<'static>> {
+fn activity_calendar_lines(
+    snapshot: &TopBarSnapshot,
+    width: u16,
+    peak_hour: Option<PeakHour>,
+) -> Vec<Line<'static>> {
     let weeks = activity_calendar_visible_weeks(width);
     let gap = activity_calendar_has_gap(width, weeks);
     let today = OffsetDateTime::now_utc().date();
@@ -293,12 +298,44 @@ fn activity_calendar_lines(snapshot: &TopBarSnapshot, width: u16) -> Vec<Line<'s
     }
     lines.push(activity_legend_line(max_tokens, gap));
     lines.push(activity_streak_line(streaks));
+    lines.push(activity_peak_hour_line(peak_hour));
     lines.push(activity_book_scale_line(
         snapshot.total_tokens,
         OffsetDateTime::now_utc().unix_timestamp(),
     ));
 
     lines
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeakHour {
+    hour: u8,
+    total_tokens: u64,
+}
+
+fn peak_hour_from_report(report: &mot::UsageReport) -> Option<PeakHour> {
+    let mut tokens_by_hour = [0u64; 24];
+
+    for hour in report.codex.hourly.iter().chain(&report.claude.hourly) {
+        if hour.hour < 24 {
+            tokens_by_hour[hour.hour as usize] += hour.totals.total_tokens();
+        }
+    }
+
+    let mut peak = None;
+    for (hour, &total_tokens) in tokens_by_hour.iter().enumerate() {
+        if total_tokens == 0 {
+            continue;
+        }
+        if peak.is_none_or(|existing: PeakHour| total_tokens > existing.total_tokens) {
+            peak = Some(PeakHour {
+                hour: hour as u8,
+                total_tokens,
+            });
+        }
+    }
+
+    peak
 }
 
 fn activity_lines_to_ansi(lines: &[Line<'_>]) -> String {
@@ -543,6 +580,40 @@ fn activity_streak_line(streaks: ActivityStreaks) -> Line<'static> {
         activity_stat_value_span(streaks.longest),
         Span::raw(format!(" {}", plural_days(streaks.longest))),
     ])
+}
+
+fn activity_peak_hour_line(peak_hour: Option<PeakHour>) -> Line<'static> {
+    let mut spans = vec![Span::raw("    Peak hour       ")];
+
+    match peak_hour {
+        Some(peak_hour) => {
+            spans.push(Span::styled(
+                format_peak_hour_range(peak_hour.hour),
+                Style::default()
+                    .fg(Color::Rgb(63, 185, 80))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(format!(
+                "  {} tokens",
+                format_calendar_count(peak_hour.total_tokens)
+            )));
+        }
+        None => {
+            spans.push(Span::styled(
+                "n/a",
+                Style::default()
+                    .fg(Color::Rgb(63, 185, 80))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw("  no Codex/Claude hourly activity"));
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn format_peak_hour_range(hour: u8) -> String {
+    format!("{:02}:00-{:02}:00", hour, (hour + 1) % 24)
 }
 
 fn plural_days(days: usize) -> &'static str {
@@ -1115,7 +1186,7 @@ fn fit_terminal_line(line: &str, max_chars: usize) -> String {
 mod tests {
     use super::{Cli, SessionSummary};
     use clap::Parser;
-    use mot::SessionProvider;
+    use mot::{SessionProvider, TokenTotals};
     use std::path::PathBuf;
 
     #[test]
@@ -1304,5 +1375,95 @@ mod tests {
                 .add_modifier
                 .contains(ratatui::style::Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn peak_hour_combines_codex_and_claude_and_ignores_droid() {
+        let mut report = empty_usage_report();
+        report.codex.hourly.push(mot::HourlyReport {
+            hour: 14,
+            totals: TokenTotals {
+                input: 10,
+                ..TokenTotals::default()
+            },
+            ..mot::HourlyReport::default()
+        });
+        report.claude.hourly.push(mot::HourlyReport {
+            hour: 14,
+            totals: TokenTotals {
+                input: 5,
+                ..TokenTotals::default()
+            },
+            ..mot::HourlyReport::default()
+        });
+        report.claude.hourly.push(mot::HourlyReport {
+            hour: 9,
+            totals: TokenTotals {
+                input: 20,
+                ..TokenTotals::default()
+            },
+            ..mot::HourlyReport::default()
+        });
+        report.droid.hourly.push(mot::HourlyReport {
+            hour: 22,
+            totals: TokenTotals {
+                input: 10_000,
+                ..TokenTotals::default()
+            },
+            ..mot::HourlyReport::default()
+        });
+
+        assert_eq!(
+            super::peak_hour_from_report(&report),
+            Some(super::PeakHour {
+                hour: 9,
+                total_tokens: 20
+            })
+        );
+    }
+
+    #[test]
+    fn activity_peak_hour_line_highlights_peak_range() {
+        let line = super::activity_peak_hour_line(Some(super::PeakHour {
+            hour: 23,
+            total_tokens: 1_234,
+        }));
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Peak hour"));
+        assert!(text.contains("23:00-00:00"));
+        assert!(text.contains("1,234 tokens"));
+        assert!(
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    fn empty_usage_report() -> mot::UsageReport {
+        mot::UsageReport {
+            scope: mot::ScopeReport {
+                mode: "global",
+                root: None,
+                window: None,
+                cutoff_unix_ms: None,
+                session: None,
+            },
+            codex: mot::ProviderReport::default(),
+            claude: mot::ProviderReport::default(),
+            droid: mot::ProviderReport::default(),
+            by_host: Vec::new(),
+            total: TokenTotals::default(),
+            estimated_cost_usd: 0.0,
+            priced_totals: TokenTotals::default(),
+            unpriced_totals: TokenTotals::default(),
+            unpriced_models: Vec::new(),
+            duration_ms: 0,
+        }
     }
 }
