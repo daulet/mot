@@ -181,6 +181,8 @@ pub struct ProviderReport {
     pub by_model: Vec<ModelReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub longest_session: Option<SessionActivityReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub largest_session: Option<SessionActivityReport>,
     #[serde(skip)]
     model_usage: HashMap<String, ModelUsage>,
     #[serde(skip)]
@@ -261,6 +263,7 @@ impl std::ops::AddAssign for ProviderReport {
         }
 
         self.longest_session = max_session_activity(self.longest_session, rhs.longest_session);
+        self.largest_session = max_session_tokens(self.largest_session, rhs.largest_session);
     }
 }
 
@@ -285,6 +288,30 @@ fn max_session_activity(
                     && right.total_tokens > left.total_tokens)
                 || (right.duration_seconds == left.duration_seconds
                     && right.total_tokens == left.total_tokens
+                    && right.records_counted > left.records_counted)
+            {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn max_session_tokens(
+    left: Option<SessionActivityReport>,
+    right: Option<SessionActivityReport>,
+) -> Option<SessionActivityReport> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if right.total_tokens > left.total_tokens
+                || (right.total_tokens == left.total_tokens
+                    && right.duration_seconds > left.duration_seconds)
+                || (right.total_tokens == left.total_tokens
+                    && right.duration_seconds == left.duration_seconds
                     && right.records_counted > left.records_counted)
             {
                 Some(right)
@@ -2383,11 +2410,13 @@ fn parse_codex_reader<R: BufRead>(
     report.totals = session_totals;
     if !session_totals.is_zero() {
         report.sessions_counted = 1;
-        report.longest_session = Some(SessionActivityReport {
+        let session_activity = SessionActivityReport {
             total_tokens: session_totals.total_tokens(),
             records_counted: report.records_counted,
             duration_seconds: session_duration_seconds(first_usage_unix_ms, last_usage_unix_ms),
-        });
+        };
+        report.longest_session = Some(session_activity);
+        report.largest_session = Some(session_activity);
     }
     report.model_usage = by_model;
     report.day_model_usage = day_model_usage;
@@ -2577,11 +2606,13 @@ fn parse_claude_reader<R: BufRead>(
     report.totals = totals;
     if !totals.is_zero() {
         report.sessions_counted = 1;
-        report.longest_session = Some(SessionActivityReport {
+        let session_activity = SessionActivityReport {
             total_tokens: totals.total_tokens(),
             records_counted: report.records_counted,
             duration_seconds: session_duration_seconds(first_usage_unix_ms, last_usage_unix_ms),
-        });
+        };
+        report.longest_session = Some(session_activity);
+        report.largest_session = Some(session_activity);
     }
     report.model_usage = by_model;
     report.day_model_usage = day_model_usage;
@@ -3141,14 +3172,16 @@ fn build_droid_report_from_settings(
     report.records_counted = 1;
     report.sessions_counted = 1;
     report.totals = totals;
-    report.longest_session = Some(SessionActivityReport {
+    let session_activity = SessionActivityReport {
         total_tokens: totals.total_tokens(),
         records_counted: report.records_counted,
         duration_seconds: session_duration_seconds(
             session_started_at.and_then(parse_rfc3339_unix_ms),
             timestamp.and_then(parse_rfc3339_unix_ms),
         ),
-    });
+    };
+    report.longest_session = Some(session_activity);
+    report.largest_session = Some(session_activity);
     report
         .model_usage
         .entry(model.clone())

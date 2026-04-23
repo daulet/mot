@@ -13,7 +13,7 @@ use time::{Date, Duration, Month, OffsetDateTime, Weekday};
 
 const ACTIVITY_CALENDAR_WEEKS: usize = 53;
 const ACTIVITY_CALENDAR_DAYS: usize = ACTIVITY_CALENDAR_WEEKS * 7;
-const ACTIVITY_CALENDAR_HEIGHT: usize = 16;
+const ACTIVITY_CALENDAR_HEIGHT: usize = 17;
 const ACTIVITY_LABEL_WIDTH: usize = 4;
 const ACTIVITY_CELL: &str = "■";
 const ACTIVITY_STAT_LABEL_WIDTH: usize = 17;
@@ -283,6 +283,7 @@ fn activity_calendar_lines(
         favorite_model: report_stats.favorite_model,
         total_tokens: snapshot.total_tokens,
         total_sessions: report_stats.total_sessions,
+        largest_session_tokens: report_stats.largest_session_tokens,
         longest_session_duration_seconds: report_stats.longest_session_duration_seconds,
         streaks,
         active_days,
@@ -319,6 +320,7 @@ fn activity_calendar_lines(
 struct ActivityReportStats {
     total_sessions: usize,
     favorite_model: Option<String>,
+    largest_session_tokens: Option<u64>,
     longest_session_duration_seconds: Option<u64>,
     peak_hour: Option<PeakHour>,
 }
@@ -327,6 +329,7 @@ fn activity_report_stats(report: &mot::UsageReport) -> ActivityReportStats {
     ActivityReportStats {
         total_sessions: total_sessions(report),
         favorite_model: favorite_model_from_report(report),
+        largest_session_tokens: largest_session_tokens_from_report(report),
         longest_session_duration_seconds: longest_session_duration_seconds_from_report(report),
         peak_hour: peak_hour_from_report(report),
     }
@@ -337,6 +340,7 @@ struct ActivityStats {
     favorite_model: Option<String>,
     total_tokens: u64,
     total_sessions: usize,
+    largest_session_tokens: Option<u64>,
     longest_session_duration_seconds: Option<u64>,
     streaks: ActivityStreaks,
     active_days: usize,
@@ -406,6 +410,18 @@ fn longest_session_duration_seconds_from_report(report: &mot::UsageReport) -> Op
     .into_iter()
     .flatten()
     .map(|session| session.duration_seconds)
+    .max()
+}
+
+fn largest_session_tokens_from_report(report: &mot::UsageReport) -> Option<u64> {
+    [
+        report.codex.largest_session,
+        report.claude.largest_session,
+        report.droid.largest_session,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|session| session.total_tokens)
     .max()
 }
 
@@ -683,6 +699,10 @@ fn activity_stats_lines(stats: &ActivityStats) -> Vec<Line<'static>> {
     let favorite_model = stats.favorite_model.as_deref().unwrap_or("n/a");
     let total_tokens = format_compact_count(stats.total_tokens);
     let sessions = format_compact_count(stats.total_sessions as u64);
+    let largest_session = stats
+        .largest_session_tokens
+        .map(format_compact_count)
+        .unwrap_or_else(|| "n/a".to_string());
     let longest_session = stats
         .longest_session_duration_seconds
         .map(format_duration_seconds)
@@ -710,14 +730,20 @@ fn activity_stats_lines(stats: &ActivityStats) -> Vec<Line<'static>> {
             "Total tokens",
             &total_tokens,
         ),
-        activity_two_column_stat_line("Sessions", &sessions, "Longest session", &longest_session),
+        activity_two_column_stat_line("Sessions", &sessions, "Largest session", &largest_session),
         activity_two_column_stat_line(
             "Current streak",
             &current_streak,
             "Longest streak",
             &longest_streak,
         ),
-        activity_two_column_stat_line("Active days", &active_days, "Peak hour", &peak_value),
+        activity_two_column_stat_line(
+            "Active days",
+            &active_days,
+            "Longest session",
+            &longest_session,
+        ),
+        activity_single_stat_line("Peak hour", &peak_value),
     ]
 }
 
@@ -742,6 +768,14 @@ fn activity_two_column_stat_line(
         Span::raw(ACTIVITY_STAT_COLUMN_GAP),
         Span::raw(format_activity_stat_label(right_label)),
         activity_stat_value_span(right_value),
+    ])
+}
+
+fn activity_single_stat_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("    "),
+        Span::raw(format_activity_stat_label(label)),
+        activity_stat_value_span(value),
     ])
 }
 
@@ -1599,6 +1633,7 @@ mod tests {
             records_counted: 1,
             duration_seconds: 3_600,
         });
+        report.codex.largest_session = report.codex.longest_session;
         report.codex.by_model.push(mot::ModelReport {
             model: "gpt-5.4".to_string(),
             records_counted: 2,
@@ -1610,6 +1645,11 @@ mod tests {
             pricing: None,
         });
         report.claude.sessions_counted = 1;
+        report.claude.largest_session = Some(mot::SessionActivityReport {
+            total_tokens: 25_000,
+            records_counted: 1,
+            duration_seconds: 120,
+        });
         report.claude.by_model.push(mot::ModelReport {
             model: "claude-sonnet".to_string(),
             records_counted: 1,
@@ -1626,6 +1666,7 @@ mod tests {
             records_counted: 1,
             duration_seconds: 86_400,
         });
+        report.droid.largest_session = report.droid.longest_session;
         report.droid.by_model.push(mot::ModelReport {
             model: "gpt-5.4".to_string(),
             records_counted: 3,
@@ -1641,6 +1682,7 @@ mod tests {
 
         assert_eq!(stats.total_sessions, 6);
         assert_eq!(stats.favorite_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(stats.largest_session_tokens, Some(25_000));
         assert_eq!(stats.longest_session_duration_seconds, Some(86_400));
     }
 
@@ -1650,6 +1692,7 @@ mod tests {
             favorite_model: Some("gpt-5.4".to_string()),
             total_tokens: 1_100_000_000,
             total_sessions: 42,
+            largest_session_tokens: Some(9_876_543),
             longest_session_duration_seconds: Some(93_900),
             streaks: super::ActivityStreaks {
                 current: 2,
@@ -1668,7 +1711,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert!(text.contains("Favorite model:"));
         assert!(text.contains("gpt-5.4"));
         assert!(text.contains("Total tokens:"));
@@ -1676,18 +1719,20 @@ mod tests {
         assert!(text.contains("Sessions:"));
         assert_eq!(lines[1].spans[2].content.as_ref(), "              42");
         assert!(!text.contains("42 sessions"));
-        assert!(text.contains("Longest session:"));
-        assert!(text.contains("1d 2h"));
+        assert!(text.contains("Largest session:"));
+        assert!(text.contains("9.9M"));
         assert!(text.contains("Current streak:"));
         assert!(text.contains("2 days"));
         assert!(text.contains("Longest streak:"));
         assert!(text.contains("13 days"));
         assert!(text.contains("Active days:"));
         assert!(text.contains("40/60"));
+        assert!(text.contains("Longest session:"));
+        assert!(text.contains("1d 2h"));
         assert!(text.contains("Peak hour:"));
         assert!(text.contains("23:00-00:00"));
         assert!(!text.contains("1,234 tokens"));
-        for line in lines {
+        for line in lines.iter().take(4) {
             assert!(
                 line.spans[2]
                     .style
@@ -1701,6 +1746,12 @@ mod tests {
                     .contains(ratatui::style::Modifier::BOLD)
             );
         }
+        assert!(
+            lines[4].spans[2]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
     }
 
     #[test]

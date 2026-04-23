@@ -48,11 +48,12 @@ the daily rollups:
 - Droid: Factory settings expose aggregate session token usage, so activity is
   assigned to `providerLockTimestamp`.
 
-The calendar footer shows favorite model, total tokens, sessions, longest
-session by duration, current and longest streaks, active days since first
-activity in the displayed calendar range, and peak hour. Peak hour is computed
-from Codex and Claude timestamped usage records. Droid is excluded from peak
-hour because its available usage is session-aggregate metadata.
+The calendar footer shows favorite model, total tokens, sessions, largest
+session by token volume, current and longest streaks, active days since first
+activity in the displayed calendar range, longest session by duration, and peak
+hour. Peak hour is computed from Codex and Claude timestamped usage records.
+Droid is excluded from peak hour because its available usage is
+session-aggregate metadata.
 
 The footer also includes a randomly selected book-scale comparison. Book word
 counts are converted to estimated tokens using the English rule of thumb that
