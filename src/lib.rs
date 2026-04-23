@@ -133,6 +133,14 @@ pub struct HostReport {
     pub estimated_cost_usd: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionActivityReport {
+    pub total_tokens: u64,
+    pub records_counted: usize,
+    #[serde(default)]
+    pub duration_seconds: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ModelUsage {
     records_counted: usize,
@@ -150,6 +158,8 @@ impl ModelUsage {
 pub struct ProviderReport {
     pub files_scanned: usize,
     pub records_counted: usize,
+    #[serde(default)]
+    pub sessions_counted: usize,
     pub parse_errors: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -169,6 +179,8 @@ pub struct ProviderReport {
     pub by_host: Vec<HostReport>,
     #[serde(default)]
     pub by_model: Vec<ModelReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longest_session: Option<SessionActivityReport>,
     #[serde(skip)]
     model_usage: HashMap<String, ModelUsage>,
     #[serde(skip)]
@@ -183,6 +195,7 @@ impl std::ops::AddAssign for ProviderReport {
     fn add_assign(&mut self, rhs: Self) {
         self.files_scanned += rhs.files_scanned;
         self.records_counted += rhs.records_counted;
+        self.sessions_counted += rhs.sessions_counted;
         self.parse_errors += rhs.parse_errors;
         self.warnings.extend(rhs.warnings);
         self.totals += rhs.totals;
@@ -246,6 +259,8 @@ impl std::ops::AddAssign for ProviderReport {
                     .or_insert(usage);
             }
         }
+
+        self.longest_session = max_session_activity(self.longest_session, rhs.longest_session);
     }
 }
 
@@ -256,6 +271,30 @@ impl std::ops::Add for ProviderReport {
         let mut out = self;
         out += rhs;
         out
+    }
+}
+
+fn max_session_activity(
+    left: Option<SessionActivityReport>,
+    right: Option<SessionActivityReport>,
+) -> Option<SessionActivityReport> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if right.duration_seconds > left.duration_seconds
+                || (right.duration_seconds == left.duration_seconds
+                    && right.total_tokens > left.total_tokens)
+                || (right.duration_seconds == left.duration_seconds
+                    && right.total_tokens == left.total_tokens
+                    && right.records_counted > left.records_counted)
+            {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 
@@ -1470,6 +1509,26 @@ fn parse_rfc3339_unix_ms(timestamp: &str) -> Option<i64> {
     i64::try_from(unix_ms).ok()
 }
 
+fn observe_session_timestamp(
+    timestamp: Option<&str>,
+    first_unix_ms: &mut Option<i64>,
+    last_unix_ms: &mut Option<i64>,
+) {
+    let Some(unix_ms) = timestamp.and_then(parse_rfc3339_unix_ms) else {
+        return;
+    };
+
+    *first_unix_ms = Some(first_unix_ms.map_or(unix_ms, |first| first.min(unix_ms)));
+    *last_unix_ms = Some(last_unix_ms.map_or(unix_ms, |last| last.max(unix_ms)));
+}
+
+fn session_duration_seconds(first_unix_ms: Option<i64>, last_unix_ms: Option<i64>) -> u64 {
+    match (first_unix_ms, last_unix_ms) {
+        (Some(first), Some(last)) if last > first => ((last - first) / 1_000) as u64,
+        _ => 0,
+    }
+}
+
 fn timestamp_day_key(timestamp: Option<&str>) -> Option<String> {
     let timestamp = timestamp?;
     let parsed = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
@@ -2182,6 +2241,8 @@ fn parse_codex_reader<R: BufRead>(
     let mut day_model_usage: HashMap<String, HashMap<String, ModelUsage>> = HashMap::new();
     let mut hour_model_usage: HashMap<u8, HashMap<String, ModelUsage>> = HashMap::new();
     let mut host_model_usage: HashMap<String, HashMap<String, ModelUsage>> = HashMap::new();
+    let mut first_usage_unix_ms: Option<i64> = None;
+    let mut last_usage_unix_ms: Option<i64> = None;
     let mut saw_usage = false;
 
     loop {
@@ -2250,6 +2311,11 @@ fn parse_codex_reader<R: BufRead>(
                                 }
 
                                 session_totals += delta;
+                                observe_session_timestamp(
+                                    parsed.timestamp.as_deref(),
+                                    &mut first_usage_unix_ms,
+                                    &mut last_usage_unix_ms,
+                                );
                                 let model = current_model
                                     .as_deref()
                                     .unwrap_or(UNKNOWN_MODEL)
@@ -2315,6 +2381,14 @@ fn parse_codex_reader<R: BufRead>(
 
     report.records_counted = 1;
     report.totals = session_totals;
+    if !session_totals.is_zero() {
+        report.sessions_counted = 1;
+        report.longest_session = Some(SessionActivityReport {
+            total_tokens: session_totals.total_tokens(),
+            records_counted: report.records_counted,
+            duration_seconds: session_duration_seconds(first_usage_unix_ms, last_usage_unix_ms),
+        });
+    }
     report.model_usage = by_model;
     report.day_model_usage = day_model_usage;
     report.hour_model_usage = hour_model_usage;
@@ -2431,10 +2505,14 @@ fn parse_claude_reader<R: BufRead>(
                                 if existing.hour_key.is_none() {
                                     existing.hour_key = hour_key;
                                 }
+                                if existing.timestamp.is_none() {
+                                    existing.timestamp = parsed.timestamp.clone();
+                                }
                             })
                             .or_insert(ClaudeRequestUsage {
                                 day_key,
                                 hour_key,
+                                timestamp: parsed.timestamp,
                                 model,
                                 totals,
                             });
@@ -2454,6 +2532,8 @@ fn parse_claude_reader<R: BufRead>(
     let mut day_model_usage: HashMap<String, HashMap<String, ModelUsage>> = HashMap::new();
     let mut hour_model_usage: HashMap<u8, HashMap<String, ModelUsage>> = HashMap::new();
     let mut totals = TokenTotals::default();
+    let mut first_usage_unix_ms: Option<i64> = None;
+    let mut last_usage_unix_ms: Option<i64> = None;
 
     for usage in by_request.into_values() {
         totals += usage.totals;
@@ -2487,9 +2567,22 @@ fn parse_claude_reader<R: BufRead>(
                 .or_default()
                 .add_record(usage.totals);
         }
+        observe_session_timestamp(
+            usage.timestamp.as_deref(),
+            &mut first_usage_unix_ms,
+            &mut last_usage_unix_ms,
+        );
     }
 
     report.totals = totals;
+    if !totals.is_zero() {
+        report.sessions_counted = 1;
+        report.longest_session = Some(SessionActivityReport {
+            total_tokens: totals.total_tokens(),
+            records_counted: report.records_counted,
+            duration_seconds: session_duration_seconds(first_usage_unix_ms, last_usage_unix_ms),
+        });
+    }
     report.model_usage = by_model;
     report.day_model_usage = day_model_usage;
     report.hour_model_usage = hour_model_usage;
@@ -2778,6 +2871,7 @@ struct ClaudeMessage {
 struct ClaudeRequestUsage {
     day_key: Option<String>,
     hour_key: Option<u8>,
+    timestamp: Option<String>,
     model: String,
     totals: TokenTotals,
 }
@@ -2853,6 +2947,8 @@ struct DroidSessionStart {
     kind: String,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2952,14 +3048,16 @@ fn scan_droid_file_with_host_label(
         }
     };
 
-    let session_cwd = if options.global || options.selected_session.is_some() {
-        None
-    } else {
-        let jsonl_path = settings_path_to_jsonl(settings_path);
-        read_droid_session_cwd(&jsonl_path)
-    };
+    let jsonl_path = settings_path_to_jsonl(settings_path);
+    let session_metadata = read_droid_session_metadata(&jsonl_path);
 
-    build_droid_report_from_settings(settings, host_label, session_cwd.as_deref(), options)
+    build_droid_report_from_settings(
+        settings,
+        host_label,
+        session_metadata.cwd.as_deref(),
+        session_metadata.started_at.as_deref(),
+        options,
+    )
 }
 
 fn settings_path_to_jsonl(settings_path: &Path) -> PathBuf {
@@ -2971,16 +3069,31 @@ fn settings_path_to_jsonl(settings_path: &Path) -> PathBuf {
     settings_path.with_file_name(jsonl_name)
 }
 
-fn read_droid_session_cwd(jsonl_path: &Path) -> Option<String> {
-    let file = File::open(jsonl_path).ok()?;
+#[derive(Debug, Default)]
+struct DroidSessionMetadata {
+    cwd: Option<String>,
+    started_at: Option<String>,
+}
+
+fn read_droid_session_metadata(jsonl_path: &Path) -> DroidSessionMetadata {
+    let Some(file) = File::open(jsonl_path).ok() else {
+        return DroidSessionMetadata::default();
+    };
     let mut reader = BufReader::new(file);
     let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let parsed: DroidSessionStart = serde_json::from_str(&line).ok()?;
-    if parsed.kind == "session_start" {
-        parsed.cwd
-    } else {
-        None
+    if reader.read_line(&mut line).is_err() {
+        return DroidSessionMetadata::default();
+    }
+    let Some(parsed) = serde_json::from_str::<DroidSessionStart>(&line).ok() else {
+        return DroidSessionMetadata::default();
+    };
+    if parsed.kind != "session_start" {
+        return DroidSessionMetadata::default();
+    }
+
+    DroidSessionMetadata {
+        cwd: parsed.cwd,
+        started_at: parsed.timestamp,
     }
 }
 
@@ -2988,6 +3101,7 @@ fn build_droid_report_from_settings(
     settings: DroidSettings,
     host_label: &str,
     session_cwd: Option<&str>,
+    session_started_at: Option<&str>,
     options: &ScanOptions,
 ) -> ProviderReport {
     let DroidSettings {
@@ -3025,7 +3139,16 @@ fn build_droid_report_from_settings(
 
     let model = model.unwrap_or_else(|| UNKNOWN_MODEL.to_string());
     report.records_counted = 1;
+    report.sessions_counted = 1;
     report.totals = totals;
+    report.longest_session = Some(SessionActivityReport {
+        total_tokens: totals.total_tokens(),
+        records_counted: report.records_counted,
+        duration_seconds: session_duration_seconds(
+            session_started_at.and_then(parse_rfc3339_unix_ms),
+            timestamp.and_then(parse_rfc3339_unix_ms),
+        ),
+    });
     report
         .model_usage
         .entry(model.clone())

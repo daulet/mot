@@ -13,9 +13,12 @@ use time::{Date, Duration, Month, OffsetDateTime, Weekday};
 
 const ACTIVITY_CALENDAR_WEEKS: usize = 53;
 const ACTIVITY_CALENDAR_DAYS: usize = ACTIVITY_CALENDAR_WEEKS * 7;
-const ACTIVITY_CALENDAR_HEIGHT: usize = 13;
+const ACTIVITY_CALENDAR_HEIGHT: usize = 16;
 const ACTIVITY_LABEL_WIDTH: usize = 4;
 const ACTIVITY_CELL: &str = "■";
+const ACTIVITY_STAT_LABEL_WIDTH: usize = 17;
+const ACTIVITY_STAT_VALUE_WIDTH: usize = 16;
+const ACTIVITY_STAT_COLUMN_GAP: &str = "        ";
 const WORDS_PER_TOKEN_ESTIMATE: f64 = 0.75;
 const BOOK_TOKEN_COMPARISONS: &[BookTokenComparison] = &[
     BookTokenComparison {
@@ -49,6 +52,10 @@ const BOOK_TOKEN_COMPARISONS: &[BookTokenComparison] = &[
     BookTokenComparison {
         title: "The Hunger Games trilogy",
         word_count: 301_583,
+    },
+    BookTokenComparison {
+        title: "A Game of Thrones",
+        word_count: 292_727,
     },
     BookTokenComparison {
         title: "A Song of Ice and Fire books 1-5",
@@ -251,8 +258,8 @@ fn render_activity_calendar(report: &mot::UsageReport) -> io::Result<()> {
     }
 
     let snapshot = mot::build_topbar_snapshot(report, ACTIVITY_CALENDAR_DAYS);
-    let peak_hour = peak_hour_from_report(report);
-    let lines = activity_calendar_lines(&snapshot, terminal_width() as u16, peak_hour);
+    let stats = activity_report_stats(report);
+    let lines = activity_calendar_lines(&snapshot, terminal_width() as u16, stats);
 
     writeln!(stdout)?;
     write!(stdout, "{}", activity_lines_to_ansi(&lines))?;
@@ -262,28 +269,28 @@ fn render_activity_calendar(report: &mot::UsageReport) -> io::Result<()> {
 fn activity_calendar_lines(
     snapshot: &TopBarSnapshot,
     width: u16,
-    peak_hour: Option<PeakHour>,
+    report_stats: ActivityReportStats,
 ) -> Vec<Line<'static>> {
     let weeks = activity_calendar_visible_weeks(width);
     let gap = activity_calendar_has_gap(width, weeks);
     let today = OffsetDateTime::now_utc().date();
     let start = activity_calendar_start_date(today, weeks);
     let day_totals = activity_day_totals(snapshot);
-    let (active_days, total_tokens, max_tokens) =
+    let (active_days, total_days, _total_tokens, max_tokens) =
         activity_calendar_totals(start, today, weeks, &day_totals);
     let streaks = activity_streaks(start, today, weeks, &day_totals);
+    let stats = ActivityStats {
+        favorite_model: report_stats.favorite_model,
+        total_tokens: snapshot.total_tokens,
+        total_sessions: report_stats.total_sessions,
+        longest_session_duration_seconds: report_stats.longest_session_duration_seconds,
+        streaks,
+        active_days,
+        total_days,
+        peak_hour: report_stats.peak_hour,
+    };
 
     let mut lines = Vec::with_capacity(ACTIVITY_CALENDAR_HEIGHT);
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Activity calendar",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " - last {weeks} weeks, {active_days} active days, {} tokens",
-            format_calendar_count(total_tokens)
-        )),
-    ]));
     lines.push(activity_month_label_line(start, today, weeks, gap));
     for row in 0..7 {
         lines.push(activity_day_row(
@@ -297,14 +304,109 @@ fn activity_calendar_lines(
         ));
     }
     lines.push(activity_legend_line(max_tokens, gap));
-    lines.push(activity_streak_line(streaks));
-    lines.push(activity_peak_hour_line(peak_hour));
+    lines.push(Line::raw(""));
+    lines.extend(activity_stats_lines(&stats));
+    lines.push(Line::raw(""));
     lines.push(activity_book_scale_line(
         snapshot.total_tokens,
         OffsetDateTime::now_utc().unix_timestamp(),
     ));
 
     lines
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityReportStats {
+    total_sessions: usize,
+    favorite_model: Option<String>,
+    longest_session_duration_seconds: Option<u64>,
+    peak_hour: Option<PeakHour>,
+}
+
+fn activity_report_stats(report: &mot::UsageReport) -> ActivityReportStats {
+    ActivityReportStats {
+        total_sessions: total_sessions(report),
+        favorite_model: favorite_model_from_report(report),
+        longest_session_duration_seconds: longest_session_duration_seconds_from_report(report),
+        peak_hour: peak_hour_from_report(report),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityStats {
+    favorite_model: Option<String>,
+    total_tokens: u64,
+    total_sessions: usize,
+    longest_session_duration_seconds: Option<u64>,
+    streaks: ActivityStreaks,
+    active_days: usize,
+    total_days: usize,
+    peak_hour: Option<PeakHour>,
+}
+
+fn total_sessions(report: &mot::UsageReport) -> usize {
+    provider_sessions_counted(&report.codex)
+        + provider_sessions_counted(&report.claude)
+        + provider_sessions_counted(&report.droid)
+}
+
+fn provider_sessions_counted(provider: &mot::ProviderReport) -> usize {
+    if provider.sessions_counted > 0 {
+        provider.sessions_counted
+    } else if provider.by_model.is_empty() {
+        0
+    } else {
+        provider.records_counted
+    }
+}
+
+fn favorite_model_from_report(report: &mot::UsageReport) -> Option<String> {
+    let mut totals_by_model: HashMap<String, (u64, usize)> = HashMap::new();
+    for model in report
+        .codex
+        .by_model
+        .iter()
+        .chain(&report.claude.by_model)
+        .chain(&report.droid.by_model)
+    {
+        let total_tokens = model.totals.total_tokens();
+        if total_tokens == 0 {
+            continue;
+        }
+
+        totals_by_model
+            .entry(model.model.clone())
+            .and_modify(|(tokens, records)| {
+                *tokens += total_tokens;
+                *records += model.records_counted;
+            })
+            .or_insert((total_tokens, model.records_counted));
+    }
+
+    totals_by_model
+        .into_iter()
+        .max_by(
+            |(left_model, (left_tokens, left_records)),
+             (right_model, (right_tokens, right_records))| {
+                left_tokens
+                    .cmp(right_tokens)
+                    .then_with(|| left_records.cmp(right_records))
+                    .then_with(|| right_model.cmp(left_model))
+            },
+        )
+        .map(|(model, _)| model)
+}
+
+fn longest_session_duration_seconds_from_report(report: &mot::UsageReport) -> Option<u64> {
+    [
+        report.codex.longest_session,
+        report.claude.longest_session,
+        report.droid.longest_session,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|session| session.duration_seconds)
+    .max()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,10 +513,11 @@ fn activity_calendar_totals(
     today: Date,
     weeks: usize,
     day_totals: &HashMap<Date, u64>,
-) -> (usize, u64, u64) {
+) -> (usize, usize, u64, u64) {
     let mut active_days = 0usize;
     let mut total_tokens = 0u64;
     let mut max_tokens = 0u64;
+    let mut first_active_date: Option<Date> = None;
 
     for offset in 0..weeks * 7 {
         let date = start + Duration::days(offset as i64);
@@ -424,13 +527,18 @@ fn activity_calendar_totals(
 
         let tokens = day_totals.get(&date).copied().unwrap_or(0);
         if tokens > 0 {
+            first_active_date.get_or_insert(date);
             active_days += 1;
             total_tokens += tokens;
             max_tokens = max_tokens.max(tokens);
         }
     }
 
-    (active_days, total_tokens, max_tokens)
+    let total_days = first_active_date
+        .map(|first_active_date| (today - first_active_date).whole_days() as usize + 1)
+        .unwrap_or(0);
+
+    (active_days, total_days, total_tokens, max_tokens)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,45 +679,46 @@ fn activity_legend_line(max_tokens: u64, gap: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-fn activity_streak_line(streaks: ActivityStreaks) -> Line<'static> {
-    Line::from(vec![
-        Span::raw("    Current streak  "),
-        activity_stat_value_span(streaks.current),
-        Span::raw(format!(" {:<4}", plural_days(streaks.current))),
-        Span::raw("    Longest streak  "),
-        activity_stat_value_span(streaks.longest),
-        Span::raw(format!(" {}", plural_days(streaks.longest))),
-    ])
-}
+fn activity_stats_lines(stats: &ActivityStats) -> Vec<Line<'static>> {
+    let favorite_model = stats.favorite_model.as_deref().unwrap_or("n/a");
+    let total_tokens = format_compact_count(stats.total_tokens);
+    let sessions = format_compact_count(stats.total_sessions as u64);
+    let longest_session = stats
+        .longest_session_duration_seconds
+        .map(format_duration_seconds)
+        .unwrap_or_else(|| "n/a".to_string());
+    let current_streak = format!(
+        "{} {}",
+        stats.streaks.current,
+        plural_days(stats.streaks.current)
+    );
+    let longest_streak = format!(
+        "{} {}",
+        stats.streaks.longest,
+        plural_days(stats.streaks.longest)
+    );
+    let active_days = format!("{}/{}", stats.active_days, stats.total_days);
+    let peak_value = match stats.peak_hour {
+        Some(peak_hour) => format_peak_hour_range(peak_hour.hour),
+        None => "n/a".to_string(),
+    };
 
-fn activity_peak_hour_line(peak_hour: Option<PeakHour>) -> Line<'static> {
-    let mut spans = vec![Span::raw("    Peak hour       ")];
-
-    match peak_hour {
-        Some(peak_hour) => {
-            spans.push(Span::styled(
-                format_peak_hour_range(peak_hour.hour),
-                Style::default()
-                    .fg(Color::Rgb(63, 185, 80))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(format!(
-                "  {} tokens",
-                format_calendar_count(peak_hour.total_tokens)
-            )));
-        }
-        None => {
-            spans.push(Span::styled(
-                "n/a",
-                Style::default()
-                    .fg(Color::Rgb(63, 185, 80))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw("  no Codex/Claude hourly activity"));
-        }
-    }
-
-    Line::from(spans)
+    vec![
+        activity_two_column_stat_line(
+            "Favorite model",
+            favorite_model,
+            "Total tokens",
+            &total_tokens,
+        ),
+        activity_two_column_stat_line("Sessions", &sessions, "Longest session", &longest_session),
+        activity_two_column_stat_line(
+            "Current streak",
+            &current_streak,
+            "Longest streak",
+            &longest_streak,
+        ),
+        activity_two_column_stat_line("Active days", &active_days, "Peak hour", &peak_value),
+    ]
 }
 
 fn format_peak_hour_range(hour: u8) -> String {
@@ -620,9 +729,32 @@ fn plural_days(days: usize) -> &'static str {
     if days == 1 { "day" } else { "days" }
 }
 
-fn activity_stat_value_span(value: usize) -> Span<'static> {
+fn activity_two_column_stat_line(
+    left_label: &str,
+    left_value: &str,
+    right_label: &str,
+    right_value: &str,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("    "),
+        Span::raw(format_activity_stat_label(left_label)),
+        activity_stat_value_span(left_value),
+        Span::raw(ACTIVITY_STAT_COLUMN_GAP),
+        Span::raw(format_activity_stat_label(right_label)),
+        activity_stat_value_span(right_value),
+    ])
+}
+
+fn format_activity_stat_label(label: &str) -> String {
+    let label = format!("{label}:");
+    let label = fit_terminal_line(&label, ACTIVITY_STAT_LABEL_WIDTH);
+    format!("{label:<ACTIVITY_STAT_LABEL_WIDTH$}")
+}
+
+fn activity_stat_value_span(value: &str) -> Span<'static> {
+    let value = fit_terminal_line(value, ACTIVITY_STAT_VALUE_WIDTH);
     Span::styled(
-        format!("{value:>4}"),
+        format!("{value:>ACTIVITY_STAT_VALUE_WIDTH$}"),
         Style::default()
             .fg(Color::Rgb(63, 185, 80))
             .add_modifier(Modifier::BOLD),
@@ -639,14 +771,14 @@ fn activity_book_scale_line(total_tokens: u64, seed: i64) -> Line<'static> {
     };
 
     Line::from(vec![
-        Span::raw("    Book scale       "),
+        Span::raw("    You've used "),
         Span::styled(
             format!("~{}", format_ratio(ratio)),
             Style::default()
                 .fg(Color::Rgb(63, 185, 80))
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(" as many tokens as {}", book.title)),
+        Span::raw(format!(" more tokens than {}", book.title)),
     ])
 }
 
@@ -751,17 +883,52 @@ fn date_from_day_key(day: &str) -> Option<Date> {
     Date::from_calendar_date(year, month, day).ok()
 }
 
-fn format_calendar_count(value: u64) -> String {
-    let digits = value.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    let len = digits.len();
-    for (i, ch) in digits.chars().enumerate() {
-        if i != 0 && (len - i).is_multiple_of(3) {
-            out.push(',');
+fn format_compact_count(value: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ];
+
+    for &(threshold, suffix) in UNITS {
+        if value >= threshold {
+            let scaled = value as f64 / threshold as f64;
+            if scaled >= 100.0 {
+                return format!("{scaled:.0}{suffix}");
+            }
+            if scaled >= 10.0 {
+                return format!("{scaled:.1}{suffix}");
+            }
+            return format!("{scaled:.1}{suffix}");
         }
-        out.push(ch);
     }
-    out
+
+    value.to_string()
+}
+
+fn format_duration_seconds(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+
+    if days > 0 {
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{hours}h {minutes}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        "<1m".to_string()
+    }
 }
 
 fn select_session_interactively(
@@ -1297,6 +1464,31 @@ mod tests {
     }
 
     #[test]
+    fn activity_calendar_totals_denominator_starts_at_first_activity() {
+        let start =
+            time::Date::from_calendar_date(2026, time::Month::April, 12).expect("valid date");
+        let today =
+            time::Date::from_calendar_date(2026, time::Month::April, 22).expect("valid date");
+        let mut day_totals = std::collections::HashMap::new();
+        day_totals.insert(today - time::Duration::days(2), 10);
+        day_totals.insert(today, 20);
+
+        let (active_days, total_days, total_tokens, max_tokens) =
+            super::activity_calendar_totals(start, today, 2, &day_totals);
+
+        assert_eq!(active_days, 2);
+        assert_eq!(total_days, 3);
+        assert_eq!(total_tokens, 30);
+        assert_eq!(max_tokens, 20);
+
+        let empty_totals = std::collections::HashMap::new();
+        assert_eq!(
+            super::activity_calendar_totals(start, today, 2, &empty_totals),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
     fn activity_streaks_report_current_and_longest_runs() {
         let start =
             time::Date::from_calendar_date(2026, time::Month::April, 12).expect("valid date");
@@ -1332,30 +1524,6 @@ mod tests {
     }
 
     #[test]
-    fn activity_streak_line_aligns_and_highlights_values() {
-        let line = super::activity_streak_line(super::ActivityStreaks {
-            current: 2,
-            longest: 13,
-        });
-
-        assert_eq!(line.spans[0].content.as_ref(), "    Current streak  ");
-        assert_eq!(line.spans[1].content.as_ref(), "   2");
-        assert_eq!(line.spans[4].content.as_ref(), "  13");
-        assert!(
-            line.spans[1]
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
-        assert!(
-            line.spans[4]
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
-    }
-
-    #[test]
     fn activity_book_scale_line_formats_ratio_under_stats() {
         assert_eq!(super::estimated_tokens_for_words(75), 100);
 
@@ -1366,9 +1534,9 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("Book scale"));
+        assert!(text.contains("You've used"));
         assert!(text.contains("~1.00x"));
-        assert!(text.contains("The Harry Potter series"));
+        assert!(text.contains("more tokens than The Harry Potter series"));
         assert!(
             line.spans[1]
                 .style
@@ -1423,26 +1591,123 @@ mod tests {
     }
 
     #[test]
-    fn activity_peak_hour_line_highlights_peak_range() {
-        let line = super::activity_peak_hour_line(Some(super::PeakHour {
-            hour: 23,
-            total_tokens: 1_234,
-        }));
-        let text = line
-            .spans
+    fn activity_report_stats_use_session_and_model_rollups() {
+        let mut report = empty_usage_report();
+        report.codex.sessions_counted = 2;
+        report.codex.longest_session = Some(mot::SessionActivityReport {
+            total_tokens: 1_000,
+            records_counted: 1,
+            duration_seconds: 3_600,
+        });
+        report.codex.by_model.push(mot::ModelReport {
+            model: "gpt-5.4".to_string(),
+            records_counted: 2,
+            totals: TokenTotals {
+                input: 100,
+                ..TokenTotals::default()
+            },
+            estimated_cost_usd: None,
+            pricing: None,
+        });
+        report.claude.sessions_counted = 1;
+        report.claude.by_model.push(mot::ModelReport {
+            model: "claude-sonnet".to_string(),
+            records_counted: 1,
+            totals: TokenTotals {
+                input: 200,
+                ..TokenTotals::default()
+            },
+            estimated_cost_usd: None,
+            pricing: None,
+        });
+        report.droid.sessions_counted = 3;
+        report.droid.longest_session = Some(mot::SessionActivityReport {
+            total_tokens: 10_000,
+            records_counted: 1,
+            duration_seconds: 86_400,
+        });
+        report.droid.by_model.push(mot::ModelReport {
+            model: "gpt-5.4".to_string(),
+            records_counted: 3,
+            totals: TokenTotals {
+                input: 150,
+                ..TokenTotals::default()
+            },
+            estimated_cost_usd: None,
+            pricing: None,
+        });
+
+        let stats = super::activity_report_stats(&report);
+
+        assert_eq!(stats.total_sessions, 6);
+        assert_eq!(stats.favorite_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(stats.longest_session_duration_seconds, Some(86_400));
+    }
+
+    #[test]
+    fn activity_stats_lines_match_requested_grid() {
+        let lines = super::activity_stats_lines(&super::ActivityStats {
+            favorite_model: Some("gpt-5.4".to_string()),
+            total_tokens: 1_100_000_000,
+            total_sessions: 42,
+            longest_session_duration_seconds: Some(93_900),
+            streaks: super::ActivityStreaks {
+                current: 2,
+                longest: 13,
+            },
+            active_days: 40,
+            total_days: 60,
+            peak_hour: Some(super::PeakHour {
+                hour: 23,
+                total_tokens: 1_234,
+            }),
+        });
+        let text = lines
             .iter()
+            .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("Peak hour"));
+        assert_eq!(lines.len(), 4);
+        assert!(text.contains("Favorite model:"));
+        assert!(text.contains("gpt-5.4"));
+        assert!(text.contains("Total tokens:"));
+        assert!(text.contains("1.1B"));
+        assert!(text.contains("Sessions:"));
+        assert_eq!(lines[1].spans[2].content.as_ref(), "              42");
+        assert!(!text.contains("42 sessions"));
+        assert!(text.contains("Longest session:"));
+        assert!(text.contains("1d 2h"));
+        assert!(text.contains("Current streak:"));
+        assert!(text.contains("2 days"));
+        assert!(text.contains("Longest streak:"));
+        assert!(text.contains("13 days"));
+        assert!(text.contains("Active days:"));
+        assert!(text.contains("40/60"));
+        assert!(text.contains("Peak hour:"));
         assert!(text.contains("23:00-00:00"));
-        assert!(text.contains("1,234 tokens"));
-        assert!(
-            line.spans[1]
-                .style
-                .add_modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
+        assert!(!text.contains("1,234 tokens"));
+        for line in lines {
+            assert!(
+                line.spans[2]
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+            assert!(
+                line.spans[5]
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            );
+        }
+    }
+
+    #[test]
+    fn format_compact_count_uses_short_suffixes() {
+        assert_eq!(super::format_compact_count(999), "999");
+        assert_eq!(super::format_compact_count(1_100), "1.1K");
+        assert_eq!(super::format_compact_count(1_100_000_000), "1.1B");
     }
 
     fn empty_usage_report() -> mot::UsageReport {
