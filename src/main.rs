@@ -13,10 +13,59 @@ use time::{Date, Duration, Month, OffsetDateTime, Weekday};
 
 const ACTIVITY_CALENDAR_WEEKS: usize = 53;
 const ACTIVITY_CALENDAR_DAYS: usize = ACTIVITY_CALENDAR_WEEKS * 7;
-const ACTIVITY_CALENDAR_HEIGHT: usize = 11;
+const ACTIVITY_CALENDAR_HEIGHT: usize = 12;
 const ACTIVITY_LABEL_WIDTH: usize = 4;
 const ACTIVITY_CELL: &str = "■";
+const WORDS_PER_TOKEN_ESTIMATE: f64 = 0.75;
+const BOOK_TOKEN_COMPARISONS: &[BookTokenComparison] = &[
+    BookTokenComparison {
+        title: "The Harry Potter series",
+        word_count: 1_083_594,
+    },
+    BookTokenComparison {
+        title: "The Lord of the Rings",
+        word_count: 481_103,
+    },
+    BookTokenComparison {
+        title: "War and Peace",
+        word_count: 587_287,
+    },
+    BookTokenComparison {
+        title: "The Hobbit",
+        word_count: 95_022,
+    },
+    BookTokenComparison {
+        title: "Moby-Dick",
+        word_count: 206_052,
+    },
+    BookTokenComparison {
+        title: "Pride and Prejudice",
+        word_count: 122_000,
+    },
+    BookTokenComparison {
+        title: "The Great Gatsby",
+        word_count: 47_000,
+    },
+    BookTokenComparison {
+        title: "The Hunger Games trilogy",
+        word_count: 301_583,
+    },
+    BookTokenComparison {
+        title: "A Song of Ice and Fire books 1-5",
+        word_count: 1_736_054,
+    },
+    BookTokenComparison {
+        title: "The Chronicles of Narnia",
+        word_count: 345_000,
+    },
+];
 const SESSION_PICKER_VISIBLE_ROWS: usize = 12;
+
+#[derive(Debug, Clone, Copy)]
+struct BookTokenComparison {
+    title: &'static str,
+    word_count: u64,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -244,6 +293,10 @@ fn activity_calendar_lines(snapshot: &TopBarSnapshot, width: u16) -> Vec<Line<'s
     }
     lines.push(activity_legend_line(max_tokens, gap));
     lines.push(activity_streak_line(streaks));
+    lines.push(activity_book_scale_line(
+        snapshot.total_tokens,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    ));
 
     lines
 }
@@ -482,17 +535,73 @@ fn activity_legend_line(max_tokens: u64, gap: bool) -> Line<'static> {
 }
 
 fn activity_streak_line(streaks: ActivityStreaks) -> Line<'static> {
-    Line::from(vec![Span::raw(format!(
-        "    Current streak: {} {}, Longest streak: {} {}",
-        streaks.current,
-        plural_days(streaks.current),
-        streaks.longest,
-        plural_days(streaks.longest)
-    ))])
+    Line::from(vec![
+        Span::raw("    Current streak  "),
+        activity_stat_value_span(streaks.current),
+        Span::raw(format!(" {:<4}", plural_days(streaks.current))),
+        Span::raw("    Longest streak  "),
+        activity_stat_value_span(streaks.longest),
+        Span::raw(format!(" {}", plural_days(streaks.longest))),
+    ])
 }
 
 fn plural_days(days: usize) -> &'static str {
     if days == 1 { "day" } else { "days" }
+}
+
+fn activity_stat_value_span(value: usize) -> Span<'static> {
+    Span::styled(
+        format!("{value:>4}"),
+        Style::default()
+            .fg(Color::Rgb(63, 185, 80))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn activity_book_scale_line(total_tokens: u64, seed: i64) -> Line<'static> {
+    let book = select_book_token_comparison(seed);
+    let estimated_book_tokens = estimated_tokens_for_words(book.word_count);
+    let ratio = if estimated_book_tokens == 0 {
+        0.0
+    } else {
+        total_tokens as f64 / estimated_book_tokens as f64
+    };
+
+    Line::from(vec![
+        Span::raw("    Book scale       "),
+        Span::styled(
+            format!("~{}", format_ratio(ratio)),
+            Style::default()
+                .fg(Color::Rgb(63, 185, 80))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" as many tokens as {}", book.title)),
+    ])
+}
+
+fn select_book_token_comparison(seed: i64) -> &'static BookTokenComparison {
+    let index = seed.unsigned_abs() as usize % BOOK_TOKEN_COMPARISONS.len();
+    &BOOK_TOKEN_COMPARISONS[index]
+}
+
+fn estimated_tokens_for_words(word_count: u64) -> u64 {
+    ((word_count as f64) / WORDS_PER_TOKEN_ESTIMATE).round() as u64
+}
+
+fn format_ratio(value: f64) -> String {
+    if value >= 100.0 {
+        format!("{value:.0}x")
+    } else if value >= 10.0 {
+        format!("{value:.1}x")
+    } else if value >= 1.0 {
+        format!("{value:.2}x")
+    } else if value >= 0.01 {
+        format!("{value:.2}x")
+    } else if value > 0.0 {
+        "<0.01x".to_string()
+    } else {
+        "0x".to_string()
+    }
 }
 
 fn activity_level_for_tokens(tokens: u64, max_tokens: u64) -> u8 {
@@ -1149,5 +1258,51 @@ mod tests {
 
         assert_eq!(streaks.current, 0);
         assert_eq!(streaks.longest, 2);
+    }
+
+    #[test]
+    fn activity_streak_line_aligns_and_highlights_values() {
+        let line = super::activity_streak_line(super::ActivityStreaks {
+            current: 2,
+            longest: 13,
+        });
+
+        assert_eq!(line.spans[0].content.as_ref(), "    Current streak  ");
+        assert_eq!(line.spans[1].content.as_ref(), "   2");
+        assert_eq!(line.spans[4].content.as_ref(), "  13");
+        assert!(
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(
+            line.spans[4]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn activity_book_scale_line_formats_ratio_under_stats() {
+        assert_eq!(super::estimated_tokens_for_words(75), 100);
+
+        let line = super::activity_book_scale_line(1_444_792, 0);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Book scale"));
+        assert!(text.contains("~1.00x"));
+        assert!(text.contains("The Harry Potter series"));
+        assert!(
+            line.spans[1]
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
     }
 }

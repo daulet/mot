@@ -48,6 +48,10 @@ the daily rollups:
 - Droid: Factory settings expose aggregate session token usage, so activity is
   assigned to `providerLockTimestamp`.
 
+Table output also includes a randomly selected book-scale comparison. Book word
+counts are converted to estimated tokens using the English rule of thumb that
+one token is roughly three quarters of a word.
+
 ## Install
 
 ```bash

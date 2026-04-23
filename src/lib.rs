@@ -118,6 +118,14 @@ pub struct DailyReport {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HourlyReport {
+    pub hour: u8,
+    pub records_counted: usize,
+    pub totals: TokenTotals,
+    pub estimated_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostReport {
     pub host: String,
     pub records_counted: usize,
