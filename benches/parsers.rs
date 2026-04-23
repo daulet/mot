@@ -134,6 +134,7 @@ fn bench_collect_usage(c: &mut Criterion) {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let global = ScanOptions {
@@ -146,6 +147,7 @@ fn bench_collect_usage(c: &mut Criterion) {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         group.bench_with_input(

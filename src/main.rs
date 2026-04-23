@@ -148,6 +148,12 @@ struct Cli {
     #[arg(long, help = "Hide the Ratatui activity calendar in table output")]
     no_activity_calendar: bool,
 
+    #[arg(
+        long,
+        help = "Exclude records whose model is missing or not known to pricing"
+    )]
+    exclude_unknown_models: bool,
+
     #[arg(long, value_name = "PATH", hide = true)]
     codex_root: Option<PathBuf>,
 
@@ -189,6 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: resolve_scope_root(cli.root),
         parallel: !cli.no_parallel,
         ssh_hosts: cli.ssh_hosts,
+        exclude_unknown_models: cli.exclude_unknown_models,
         ..ScanOptions::default()
     };
 
@@ -1422,6 +1429,13 @@ mod tests {
     }
 
     #[test]
+    fn exclude_unknown_models_flag_is_collected() {
+        let parsed = Cli::try_parse_from(["mot", "--exclude-unknown-models"])
+            .expect("parse exclude unknown models");
+        assert!(parsed.exclude_unknown_models);
+    }
+
+    #[test]
     fn hidden_activity_timezone_offset_accepts_negative_values() {
         let parsed = Cli::try_parse_from(["mot", "--activity-timezone-offset-seconds", "-25200"])
             .expect("parse negative timezone offset");
@@ -1560,6 +1574,7 @@ mod tests {
                 root: None,
                 window: None,
                 cutoff_unix_ms: None,
+                exclude_unknown_models: false,
                 session: None,
             },
             activity_timezone_offset_seconds: -7 * 60 * 60,
@@ -1803,6 +1818,7 @@ mod tests {
                 root: None,
                 window: None,
                 cutoff_unix_ms: None,
+                exclude_unknown_models: false,
                 session: None,
             },
             activity_timezone_offset_seconds: 0,

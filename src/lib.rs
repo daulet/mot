@@ -331,6 +331,7 @@ pub struct ScopeReport {
     pub root: Option<PathBuf>,
     pub window: Option<String>,
     pub cutoff_unix_ms: Option<i64>,
+    pub exclude_unknown_models: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionSummary>,
 }
@@ -387,6 +388,7 @@ pub struct ScanOptions {
     pub ssh_hosts: Vec<String>,
     pub selected_session: Option<SessionSummary>,
     pub activity_timezone_offset_seconds: i32,
+    pub exclude_unknown_models: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -412,6 +414,7 @@ impl Default for ScanOptions {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: local_timezone_offset_seconds(),
+            exclude_unknown_models: false,
         }
     }
 }
@@ -558,6 +561,7 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
             },
             window: options.window.as_ref().map(|window| window.spec.clone()),
             cutoff_unix_ms: options.window.as_ref().map(|window| window.cutoff_unix_ms),
+            exclude_unknown_models: options.exclude_unknown_models,
             session: options.selected_session.clone(),
         },
         activity_timezone_offset_seconds: options.activity_timezone_offset_seconds,
@@ -1369,6 +1373,15 @@ fn lookup_model_pricing(model: &str) -> Option<ModelPricing> {
     None
 }
 
+fn should_exclude_unknown_model(model: &str) -> bool {
+    lookup_model_pricing(model).is_none()
+}
+
+fn is_missing_model_metadata(model: &str) -> bool {
+    let normalized = model.trim();
+    normalized.is_empty() || normalized == UNKNOWN_MODEL
+}
+
 fn model_rule_matches(model: &str, pattern: &str) -> bool {
     if model == pattern {
         return true;
@@ -2024,6 +2037,7 @@ fn parse_codex_reader<R: BufRead>(
     let mut first_usage_unix_ms: Option<i64> = None;
     let mut last_usage_unix_ms: Option<i64> = None;
     let mut saw_usage = false;
+    let mut included_usage = false;
 
     loop {
         line.clear();
@@ -2090,26 +2104,28 @@ fn parse_codex_reader<R: BufRead>(
                                     continue;
                                 }
 
+                                let model = current_model
+                                    .as_deref()
+                                    .unwrap_or(UNKNOWN_MODEL)
+                                    .to_string();
+                                if options.exclude_unknown_models
+                                    && should_exclude_unknown_model(&model)
+                                {
+                                    continue;
+                                }
+
+                                included_usage = true;
                                 session_totals += delta;
                                 observe_session_timestamp(
                                     parsed.timestamp.as_deref(),
                                     &mut first_usage_unix_ms,
                                     &mut last_usage_unix_ms,
                                 );
-                                let model = current_model
-                                    .as_deref()
-                                    .unwrap_or(UNKNOWN_MODEL)
-                                    .to_string();
                                 by_model.entry(model.clone()).or_default().add_record(delta);
                                 host_model_usage
                                     .entry(host_label.to_string())
                                     .or_default()
-                                    .entry(
-                                        current_model
-                                            .as_deref()
-                                            .unwrap_or(UNKNOWN_MODEL)
-                                            .to_string(),
-                                    )
+                                    .entry(model.clone())
                                     .or_default()
                                     .add_record(delta);
                                 if let Some(day_key) = timestamp_day_key(
@@ -2147,7 +2163,7 @@ fn parse_codex_reader<R: BufRead>(
         }
     }
 
-    if !saw_usage {
+    if !saw_usage || (options.exclude_unknown_models && !included_usage) {
         return report;
     }
 
@@ -2286,7 +2302,9 @@ fn parse_claude_reader<R: BufRead>(
                             .entry(key)
                             .and_modify(|existing| {
                                 existing.totals.max_assign(&totals);
-                                if existing.model == UNKNOWN_MODEL && model != UNKNOWN_MODEL {
+                                if is_missing_model_metadata(&existing.model)
+                                    && !is_missing_model_metadata(&model)
+                                {
                                     existing.model = model.clone();
                                 }
                                 if existing.day_key.is_none() {
@@ -2317,15 +2335,20 @@ fn parse_claude_reader<R: BufRead>(
         }
     }
 
-    report.records_counted = by_request.len();
     let mut by_model: HashMap<String, ModelUsage> = HashMap::new();
     let mut day_model_usage: HashMap<String, HashMap<String, ModelUsage>> = HashMap::new();
     let mut hour_model_usage: HashMap<u8, HashMap<String, ModelUsage>> = HashMap::new();
     let mut totals = TokenTotals::default();
     let mut first_usage_unix_ms: Option<i64> = None;
     let mut last_usage_unix_ms: Option<i64> = None;
+    let mut records_counted = 0usize;
 
     for usage in by_request.into_values() {
+        if options.exclude_unknown_models && should_exclude_unknown_model(&usage.model) {
+            continue;
+        }
+
+        records_counted += 1;
         totals += usage.totals;
         let day_key = usage.day_key;
         let hour_key = usage.hour_key;
@@ -2364,6 +2387,7 @@ fn parse_claude_reader<R: BufRead>(
         );
     }
 
+    report.records_counted = records_counted;
     report.totals = totals;
     if !totals.is_zero() {
         report.sessions_counted = 1;
@@ -2469,6 +2493,14 @@ fn classify_remote_mot_failure(host: &str, stderr: &str, stdout: &str) -> Option
         ));
     }
 
+    let unknown_exclude_models_flag = combined_lower.contains("--exclude-unknown-models")
+        && output_looks_like_unknown_argument(&combined_lower);
+    if unknown_exclude_models_flag {
+        return Some(format!(
+            "host {host}: remote mot does not support --exclude-unknown-models; skipping host (upgrade mot on remote)"
+        ));
+    }
+
     let unknown_json_flag =
         combined_lower.contains("--json") && output_looks_like_unknown_argument(&combined_lower);
     if unknown_json_flag {
@@ -2513,6 +2545,9 @@ fn build_remote_mot_script(options: &ScanOptions) -> String {
     if let Some(window) = &options.window {
         args.push("--window".to_string());
         args.push(window.spec.clone());
+    }
+    if options.exclude_unknown_models {
+        args.push("--exclude-unknown-models".to_string());
     }
     args.push(format!(
         "--activity-timezone-offset-seconds={}",
@@ -2784,6 +2819,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -2821,6 +2857,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -2869,6 +2906,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -2949,6 +2987,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -2998,6 +3037,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -3050,6 +3090,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -3110,6 +3151,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: -7 * 60 * 60,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -3151,6 +3193,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -3163,6 +3206,85 @@ mod tests {
                 .unpriced_models
                 .contains(&"mystery-model".to_string())
         );
+    }
+
+    #[test]
+    fn exclude_unknown_models_removes_unknown_usage_from_outputs() {
+        let temp = tempdir().expect("create tempdir");
+
+        let codex_root = temp.path().join("codex");
+        fs::create_dir_all(&codex_root).expect("create codex root");
+        fs::write(
+            codex_root.join("session.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\"}}\n",
+                "{\"timestamp\":\"2026-03-20T09:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":100,\"cached_input_tokens\":10,\"output_tokens\":5,\"reasoning_output_tokens\":2}}}}\n"
+            ),
+        )
+        .expect("write codex session");
+        fs::write(
+            codex_root.join("named-unpriced.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/proj\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"cwd\":\"/tmp/proj\",\"model\":\"mystery-model\"}}\n",
+                "{\"timestamp\":\"2026-03-20T09:30:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":25,\"cached_input_tokens\":2,\"output_tokens\":3,\"reasoning_output_tokens\":1}}}}\n"
+            ),
+        )
+        .expect("write named unpriced codex session");
+
+        let claude_root = temp.path().join("claude/projects/test");
+        fs::create_dir_all(&claude_root).expect("create claude root");
+        fs::write(
+            claude_root.join("session.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-03-20T09:00:00Z\",\"type\":\"assistant\",\"cwd\":\"/tmp/proj\",\"requestId\":\"unknown\",\"message\":{\"id\":\"m-unknown\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}\n",
+                "{\"timestamp\":\"2026-03-20T10:00:00Z\",\"type\":\"assistant\",\"cwd\":\"/tmp/proj\",\"requestId\":\"known\",\"message\":{\"model\":\"claude-sonnet-4-5-20250929\",\"id\":\"m-known\",\"usage\":{\"input_tokens\":30,\"output_tokens\":6,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":1}}}\n"
+            ),
+        )
+        .expect("write claude session");
+
+        let report = collect_usage(&ScanOptions {
+            global: true,
+            root: PathBuf::from("/tmp/proj"),
+            codex_root,
+            claude_root: temp.path().join("claude/projects"),
+            parallel: false,
+            window: None,
+            ssh_hosts: Vec::new(),
+            selected_session: None,
+            activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: true,
+        });
+
+        assert_eq!(report.codex.records_counted, 0);
+        assert_eq!(report.codex.sessions_counted, 0);
+        assert_eq!(report.codex.totals.total_tokens(), 0);
+        assert_eq!(report.claude.records_counted, 1);
+        assert_eq!(report.total.input, 30);
+        assert_eq!(report.total.output, 6);
+        assert_eq!(report.total.cache_read, 3);
+        assert_eq!(report.total.cache_write, 1);
+        assert!(!report.unpriced_models.contains(&UNKNOWN_MODEL.to_string()));
+        assert!(report.unpriced_totals.is_zero());
+        assert!(
+            report
+                .codex
+                .by_model
+                .iter()
+                .chain(&report.claude.by_model)
+                .all(|model| model.model != UNKNOWN_MODEL && model.model != "mystery-model")
+        );
+        assert_eq!(
+            report.claude.daily.first().map(|day| day.totals.input),
+            Some(30)
+        );
+        assert_eq!(report.claude.hourly.first().map(|hour| hour.hour), Some(10));
+
+        let rendered = render_report(&report);
+        assert!(!rendered.contains(UNKNOWN_MODEL));
+        assert!(!rendered.contains("mystery-model"));
+        assert!(!rendered.contains("Unpriced tokens:"));
+        assert!(!rendered.contains("Unpriced models:"));
     }
 
     #[test]
@@ -3198,6 +3320,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let report = collect_usage(&options);
@@ -3246,6 +3369,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
 
         let summaries = list_session_summaries(&options);
@@ -3302,6 +3426,7 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
         };
         options.selected_session =
             Some(resolve_session_selection(&options, "s2").expect("resolve selected session"));
@@ -3483,6 +3608,7 @@ mod tests {
                 root: None,
                 window: None,
                 cutoff_unix_ms: None,
+                exclude_unknown_models: false,
                 session: None,
             },
             activity_timezone_offset_seconds: -7 * 60 * 60,
@@ -3723,11 +3849,12 @@ mod tests {
             ssh_hosts: Vec::new(),
             selected_session: None,
             activity_timezone_offset_seconds: -7 * 60 * 60,
+            exclude_unknown_models: true,
         });
 
         assert!(script.contains("command -v mot"));
         assert!(script.contains(
-            "'mot' '--json' '--root' '/tmp/proj' '--window' '7d' '--activity-timezone-offset-seconds=-25200'"
+            "'mot' '--json' '--root' '/tmp/proj' '--window' '7d' '--exclude-unknown-models' '--activity-timezone-offset-seconds=-25200'"
         ));
     }
 
@@ -3760,6 +3887,14 @@ mod tests {
         let stderr = "error: unexpected argument '--activity-timezone-offset-seconds' found";
         let warning = classify_remote_mot_failure("vm-a", stderr, "").expect("expected warning");
         assert!(warning.contains("timezone-aligned activity stats"));
+        assert!(warning.contains("upgrade mot on remote"));
+    }
+
+    #[test]
+    fn classify_remote_mot_failure_detects_old_exclude_unknown_models_flag() {
+        let stderr = "error: unexpected argument '--exclude-unknown-models' found";
+        let warning = classify_remote_mot_failure("vm-a", stderr, "").expect("expected warning");
+        assert!(warning.contains("--exclude-unknown-models"));
         assert!(warning.contains("upgrade mot on remote"));
     }
 

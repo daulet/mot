@@ -11,6 +11,7 @@ mot --window 7d # only count tokens in last week
 mot --session 019d8e7f # only count one local session by id, id prefix, file name, or path
 mot --select-session # choose a scoped local session with an arrow-key picker
 mot --no-activity-calendar # hide the Ratatui activity calendar
+mot --exclude-unknown-models # drop usage records whose model is missing or unpriced
 mot --global --since 1m # all sessions, only count tokens in past month
 mot --global --ssh-host vm-a --ssh-host vm-b # include remote VM sessions over SSH
 ```
