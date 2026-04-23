@@ -827,8 +827,6 @@ fn format_ratio(value: f64) -> String {
         format!("{value:.0}x")
     } else if value >= 10.0 {
         format!("{value:.1}x")
-    } else if value >= 1.0 {
-        format!("{value:.2}x")
     } else if value >= 0.01 {
         format!("{value:.2}x")
     } else if value > 0.0 {

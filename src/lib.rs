@@ -941,7 +941,7 @@ fn build_hourly_reports(
         });
     }
 
-    hourly.sort_by(|a, b| a.hour.cmp(&b.hour));
+    hourly.sort_by_key(|entry| entry.hour);
     hourly
 }
 
@@ -1145,7 +1145,7 @@ fn merge_hourly_reports(dst: &mut Vec<HourlyReport>, src: Vec<HourlyReport>) {
         }
     }
 
-    dst.sort_by(|a, b| a.hour.cmp(&b.hour));
+    dst.sort_by_key(|entry| entry.hour);
 }
 
 fn merge_host_reports(dst: &mut Vec<HostReport>, src: Vec<HostReport>) {
