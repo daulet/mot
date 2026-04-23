@@ -1,19 +1,21 @@
 # mot
 
-Count token usage and estimate project cost.
+Count used tokens and estimate project cost.
+
+![sample](.github/assets/screen.png)
 
 ## Usage
 
 ```bash
 mot # scoped to current directory
-mot --global # aggregation across all local sessions
-mot --window 7d # only count tokens in last week
+mot --all # aggregation across all local sessions
+mot --since 7d # only count tokens in last week
 mot --session 019d8e7f # only count one local session by id, id prefix, file name, or path
 mot --select-session # choose a scoped local session with an arrow-key picker
-mot --no-activity-calendar # hide the Ratatui activity calendar
+mot --no-activity-calendar # hide the activity calendar
 mot --exclude-unknown-models # drop usage records whose model is missing or unpriced
-mot --global --since 1m # all sessions, only count tokens in past month
-mot --global --ssh-host vm-a --ssh-host vm-b # include remote VM sessions over SSH
+mot --all --since 1m # all sessions, only count tokens in past month
+mot --all --host vm-a --host vm-b # include remote VM sessions over SSH
 ```
 
 Sample output:
@@ -70,7 +72,7 @@ cargo install --git https://github.com/daulet/mot
 `mot` can aggregate sessions from remote hosts over SSH:
 
 ```bash
-mot --global --ssh-host user@vm-a --ssh-host user@vm-b
+mot --all --host user@vm-a --host user@vm-b
 ```
 
 Notes:
@@ -79,4 +81,5 @@ Notes:
 - It shells out to local `ssh` and runs `mot --json` on the remote host, so `mot` must be installed remotely and available in `PATH`.
 - Remote activity stats are requested with the caller's local timezone offset so calendar days, streaks, and peak hour use one shared boundary before reports are merged.
 - If a remote host has an older/incompatible `mot` (or missing `mot`), that host is skipped and surfaced in `Warnings` output.
-- For cross-host aggregation, `--global` is usually the right choice because scoped mode still filters by the recorded session `cwd`.
+- For cross-host aggregation, `--all` is usually the right choice because scoped mode still filters by the recorded session `cwd`.
+- Compatibility aliases still work: `--global`, `--window`, and `--ssh-host`.

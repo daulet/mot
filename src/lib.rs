@@ -454,48 +454,48 @@ pub fn parse_time_window(spec: &str) -> Result<TimeWindow, String> {
 fn parse_time_window_at(spec: &str, now_unix_ms: i64) -> Result<TimeWindow, String> {
     let compact = normalize_window_spec(spec);
     if compact.is_empty() {
-        return Err("time window is empty (examples: 1d, 7d, 1m, 1y)".to_string());
+        return Err("duration is empty (examples: 1d, 7d, 1m, 1y)".to_string());
     }
 
     let split_at = compact
         .find(|ch: char| !ch.is_ascii_digit())
-        .ok_or_else(|| "time window must end with a unit (examples: 1d, 7d, 1m, 1y)".to_string())?;
+        .ok_or_else(|| "duration must end with a unit (examples: 1d, 7d, 1m, 1y)".to_string())?;
 
     if split_at == 0 {
-        return Err("time window must start with a positive integer".to_string());
+        return Err("duration must start with a positive integer".to_string());
     }
 
     let (value_str, unit) = compact.split_at(split_at);
     let value = value_str
         .parse::<u64>()
-        .map_err(|_| format!("invalid time window value: {value_str}"))?;
+        .map_err(|_| format!("invalid duration value: {value_str}"))?;
     if value == 0 {
-        return Err("time window value must be greater than zero".to_string());
+        return Err("duration value must be greater than zero".to_string());
     }
 
     let seconds = match unit {
         "s" | "sec" | "secs" | "second" | "seconds" => value,
         "min" | "mins" | "minute" | "minutes" => value
             .checked_mul(60)
-            .ok_or_else(|| "time window too large".to_string())?,
+            .ok_or_else(|| "duration too large".to_string())?,
         "h" | "hr" | "hrs" | "hour" | "hours" => value
             .checked_mul(60 * 60)
-            .ok_or_else(|| "time window too large".to_string())?,
+            .ok_or_else(|| "duration too large".to_string())?,
         "d" | "day" | "days" => value
             .checked_mul(24 * 60 * 60)
-            .ok_or_else(|| "time window too large".to_string())?,
+            .ok_or_else(|| "duration too large".to_string())?,
         "w" | "wk" | "wks" | "week" | "weeks" => value
             .checked_mul(7 * 24 * 60 * 60)
-            .ok_or_else(|| "time window too large".to_string())?,
+            .ok_or_else(|| "duration too large".to_string())?,
         "m" | "mo" | "mon" | "month" | "months" => value
             .checked_mul(30 * 24 * 60 * 60)
-            .ok_or_else(|| "time window too large".to_string())?,
+            .ok_or_else(|| "duration too large".to_string())?,
         "y" | "yr" | "yrs" | "year" | "years" => value
             .checked_mul(365 * 24 * 60 * 60)
-            .ok_or_else(|| "time window too large".to_string())?,
+            .ok_or_else(|| "duration too large".to_string())?,
         _ => {
             return Err(format!(
-                "unsupported time window unit: {unit} (use s|min|h|d|w|m|y)"
+                "unsupported duration unit: {unit} (use s|min|h|d|w|m|y)"
             ));
         }
     };
@@ -503,7 +503,7 @@ fn parse_time_window_at(spec: &str, now_unix_ms: i64) -> Result<TimeWindow, Stri
     let duration_ms = seconds
         .checked_mul(1_000)
         .and_then(|ms| i64::try_from(ms).ok())
-        .ok_or_else(|| "time window too large".to_string())?;
+        .ok_or_else(|| "duration too large".to_string())?;
     let cutoff_unix_ms = now_unix_ms.saturating_sub(duration_ms);
 
     Ok(TimeWindow {
@@ -553,7 +553,7 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
 
     let mut report = UsageReport {
         scope: ScopeReport {
-            mode: if options.global { "global" } else { "scoped" },
+            mode: if options.global { "all" } else { "scoped" },
             root: if options.global {
                 None
             } else {
@@ -593,10 +593,10 @@ pub fn render_report(report: &UsageReport) -> String {
         Some(root) => {
             out.push_str(&format!("Scope: {}\n", root.display()));
         }
-        None => out.push_str("Scope: global\n"),
+        None => out.push_str("Scope: all\n"),
     }
     if let Some(window) = &report.scope.window {
-        out.push_str(&format!("Window: last {window}\n"));
+        out.push_str(&format!("Time filter: last {window}\n"));
     }
     if let Some(session) = &report.scope.session {
         out.push_str(&format!(
@@ -2537,13 +2537,13 @@ fn classify_remote_mot_parse_failure(host: &str, stdout: &str, _stderr: &str) ->
 fn build_remote_mot_script(options: &ScanOptions) -> String {
     let mut args = vec![REMOTE_MOT_BINARY.to_string(), "--json".to_string()];
     if options.global {
-        args.push("--global".to_string());
+        args.push("--all".to_string());
     } else {
         args.push("--root".to_string());
         args.push(options.root.display().to_string());
     }
     if let Some(window) = &options.window {
-        args.push("--window".to_string());
+        args.push("--since".to_string());
         args.push(window.spec.clone());
     }
     if options.exclude_unknown_models {
@@ -3604,7 +3604,7 @@ mod tests {
     fn merge_remote_usage_report_for_host_combines_activity_stats() {
         let mut report = UsageReport {
             scope: ScopeReport {
-                mode: "global",
+                mode: "all",
                 root: None,
                 window: None,
                 cutoff_unix_ms: None,
@@ -3854,8 +3854,28 @@ mod tests {
 
         assert!(script.contains("command -v mot"));
         assert!(script.contains(
-            "'mot' '--json' '--root' '/tmp/proj' '--window' '7d' '--exclude-unknown-models' '--activity-timezone-offset-seconds=-25200'"
+            "'mot' '--json' '--root' '/tmp/proj' '--since' '7d' '--exclude-unknown-models' '--activity-timezone-offset-seconds=-25200'"
         ));
+    }
+
+    #[test]
+    fn remote_mot_script_uses_all_for_global_scan() {
+        let script = build_remote_mot_script(&ScanOptions {
+            global: true,
+            root: PathBuf::from("/tmp/proj"),
+            codex_root: PathBuf::from("missing"),
+            claude_root: PathBuf::from("missing"),
+            parallel: false,
+            window: None,
+            ssh_hosts: Vec::new(),
+            selected_session: None,
+            activity_timezone_offset_seconds: 0,
+            exclude_unknown_models: false,
+        });
+
+        assert!(script.contains("'mot' '--json' '--all'"));
+        assert!(!script.contains("'--global'"));
+        assert!(!script.contains("'--root'"));
     }
 
     #[test]

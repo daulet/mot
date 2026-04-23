@@ -93,8 +93,9 @@ struct Cli {
     version: bool,
 
     #[arg(
-        long,
-        help = "Count usage globally across all discovered Codex/Claude sessions on this host"
+        long = "all",
+        alias = "global",
+        help = "Count usage across all discovered Codex/Claude sessions on this host"
     )]
     global: bool,
 
@@ -118,10 +119,10 @@ struct Cli {
     no_parallel: bool,
 
     #[arg(
-        long,
-        visible_alias = "since",
+        long = "since",
+        alias = "window",
         value_name = "DURATION",
-        help = "Only include usage in trailing window, e.g. 1d, 7d, 1m, 1y"
+        help = "Only include usage in a trailing duration, e.g. 1d, 7d, 1m, 1y"
     )]
     window: Option<String>,
 
@@ -139,9 +140,10 @@ struct Cli {
     select_session: bool,
 
     #[arg(
-        long = "ssh-host",
+        long = "host",
+        alias = "ssh-host",
         value_name = "HOST",
-        help = "Aggregate usage from a remote VM over SSH; repeat to scan multiple hosts"
+        help = "Aggregate usage from a remote host over SSH; repeat to scan multiple hosts"
     )]
     ssh_hosts: Vec<String>,
 
@@ -218,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if (cli.session.is_some() || cli.select_session) && has_ssh_hosts {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "session filtering is local-only and cannot be combined with --ssh-host",
+            "session filtering is local-only and cannot be combined with --host",
         )
         .into());
     }
@@ -1264,7 +1266,7 @@ impl Drop for RawTerminal {
 
 fn scope_label(options: &ScanOptions) -> String {
     if options.global {
-        "global scope".to_string()
+        "all sessions".to_string()
     } else {
         options.root.display().to_string()
     }
@@ -1403,8 +1405,30 @@ mod tests {
     }
 
     #[test]
-    fn ssh_host_flag_is_collected() {
-        let parsed = Cli::try_parse_from(["mot", "--ssh-host", "hwvm"]).expect("parse ssh host");
+    fn all_flag_is_collected() {
+        let parsed = Cli::try_parse_from(["mot", "--all"]).expect("parse all");
+        assert!(parsed.global);
+
+        let parsed = Cli::try_parse_from(["mot", "--global"]).expect("parse global alias");
+        assert!(parsed.global);
+    }
+
+    #[test]
+    fn since_flag_is_collected() {
+        let parsed = Cli::try_parse_from(["mot", "--since", "7d"]).expect("parse since");
+        assert_eq!(parsed.window.as_deref(), Some("7d"));
+
+        let parsed = Cli::try_parse_from(["mot", "--window", "7d"]).expect("parse window alias");
+        assert_eq!(parsed.window.as_deref(), Some("7d"));
+    }
+
+    #[test]
+    fn host_flag_is_collected() {
+        let parsed = Cli::try_parse_from(["mot", "--host", "hwvm"]).expect("parse host");
+        assert_eq!(parsed.ssh_hosts, vec!["hwvm"]);
+
+        let parsed =
+            Cli::try_parse_from(["mot", "--ssh-host", "hwvm"]).expect("parse ssh host alias");
         assert_eq!(parsed.ssh_hosts, vec!["hwvm"]);
     }
 
@@ -1472,7 +1496,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let frame = super::build_session_picker_frame(&sessions, "global scope", 4, 0, 40, 8);
+        let frame = super::build_session_picker_frame(&sessions, "all sessions", 4, 0, 40, 8);
         assert!(frame.lines.len() <= 8);
         assert_eq!(frame.selected_line, 7);
         assert!(frame.lines.iter().all(|line| line.chars().count() <= 39));
@@ -1570,7 +1594,7 @@ mod tests {
     fn activity_calendar_lines_use_snapshot_day_as_today() {
         let snapshot = mot::TopBarSnapshot {
             scope: mot::ScopeReport {
-                mode: "global",
+                mode: "all",
                 root: None,
                 window: None,
                 cutoff_unix_ms: None,
@@ -1814,7 +1838,7 @@ mod tests {
     fn empty_usage_report() -> mot::UsageReport {
         mot::UsageReport {
             scope: mot::ScopeReport {
-                mode: "global",
+                mode: "all",
                 root: None,
                 window: None,
                 cutoff_unix_ms: None,
