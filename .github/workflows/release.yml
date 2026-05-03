@@ -21,6 +21,8 @@ env:
   TAP_BRANCH: main
   FORMULA_PATH: Formula/mot.rb
   FORMULA_DESC: "Fast CLI to aggregate LLM token usage from Codex and Claude Code metadata"
+  DEB_HOMEPAGE: "https://github.com/daulet/mot"
+  DEB_DEPENDS: ""
 
 concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
@@ -143,7 +145,7 @@ jobs:
           LINKER_ENV: ${{ matrix.linker_env }}
         run: |
           if [[ -n "${LINKER_ENV}" ]]; then
-            export "${LINKER_ENV}"
+            export "${LINKER_ENV?}"
           fi
           cargo build --release --locked --target "${TARGET}"
 
@@ -165,7 +167,9 @@ jobs:
               --version "${VERSION}" \
               --arch "${DEB_ARCH}" \
               --out-dir dist \
-              --desc "${FORMULA_DESC}"
+              --desc "${FORMULA_DESC}" \
+              --homepage "${DEB_HOMEPAGE}" \
+              --depends "${DEB_DEPENDS}"
           fi
 
           rm -f "dist/${BINARY_NAME}"
@@ -329,3 +333,105 @@ jobs:
           git add "${FORMULA_PATH}"
           git commit -m "mot ${{ needs.resolve_tag.outputs.version }}"
           git push origin HEAD:"${TAP_BRANCH}"
+
+  update_apt:
+    name: Update APT Repository
+    needs:
+      - resolve_tag
+      - publish
+    runs-on: ubuntu-latest
+    env:
+      PACKAGES_REPO: daulet/packages
+      PACKAGES_REPO_TOKEN: ${{ secrets.PACKAGES_REPO_TOKEN || secrets.TAP_GITHUB_TOKEN || secrets.HOMEBREW_TAP_TOKEN }}
+      PACKAGE_RELEASE_TAG: mot-${{ needs.resolve_tag.outputs.tag }}
+    steps:
+      - name: Check packages token
+        id: packages_token
+        shell: bash
+        run: |
+          if [[ -n "${PACKAGES_REPO_TOKEN}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=APT repository update skipped::Set PACKAGES_REPO_TOKEN with contents write access to ${PACKAGES_REPO}."
+          fi
+
+      - name: Download build artifacts
+        if: steps.packages_token.outputs.available == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Resolve Debian package assets
+        if: steps.packages_token.outputs.available == 'true'
+        id: debs
+        shell: bash
+        run: |
+          AMD64_DEB="$(find dist -maxdepth 1 -type f -name '*.deb' | grep -E '[_-]amd64\.deb$' | sort | head -n1)"
+          ARM64_DEB="$(find dist -maxdepth 1 -type f -name '*.deb' | grep -E '[_-]arm64\.deb$' | sort | head -n1)"
+
+          if [[ -z "${AMD64_DEB}" || -z "${ARM64_DEB}" ]]; then
+            echo "Failed to locate amd64 and arm64 .deb artifacts in dist" >&2
+            ls -la dist >&2
+            exit 1
+          fi
+
+          {
+            echo "amd64_name=$(basename "${AMD64_DEB}")"
+            echo "amd64_sha=$(sha256sum "${AMD64_DEB}" | awk '{print $1}')"
+            echo "arm64_name=$(basename "${ARM64_DEB}")"
+            echo "arm64_sha=$(sha256sum "${ARM64_DEB}" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish Debian packages to packages repository release
+        if: steps.packages_token.outputs.available == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ env.PACKAGES_REPO }}
+          token: ${{ env.PACKAGES_REPO_TOKEN }}
+          tag_name: ${{ env.PACKAGE_RELEASE_TAG }}
+          name: ${{ env.BINARY_NAME }} ${{ needs.resolve_tag.outputs.tag }} Debian packages
+          files: dist/*.deb
+          overwrite_files: true
+
+      - name: Checkout packages repository
+        if: steps.packages_token.outputs.available == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PACKAGES_REPO }}
+          token: ${{ env.PACKAGES_REPO_TOKEN }}
+          path: packages
+
+      - name: Update packages manifest
+        if: steps.packages_token.outputs.available == 'true'
+        shell: bash
+        run: |
+          python3 packages/scripts/update-package.py \
+            --manifest packages/packages.json \
+            --name "${BINARY_NAME}" \
+            --repo "${PACKAGES_REPO}" \
+            --tag "${PACKAGE_RELEASE_TAG}" \
+            --version "${{ needs.resolve_tag.outputs.version }}" \
+            --asset "amd64:${{ steps.debs.outputs.amd64_name }}:${{ steps.debs.outputs.amd64_sha }}" \
+            --asset "arm64:${{ steps.debs.outputs.arm64_name }}:${{ steps.debs.outputs.arm64_sha }}"
+
+      - name: Commit and push packages manifest
+        if: steps.packages_token.outputs.available == 'true'
+        shell: bash
+        run: |
+          cd packages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [[ -z "$(git status --porcelain -- packages.json)" ]]; then
+            echo "APT package manifest already up to date."
+            exit 0
+          fi
+
+          git add packages.json
+          git commit -m "${BINARY_NAME} ${{ needs.resolve_tag.outputs.version }}"
+          git pull --rebase origin main
+          git push origin HEAD:main
+

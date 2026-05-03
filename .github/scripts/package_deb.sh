@@ -3,10 +3,10 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Package mot as a Debian archive.
+Package a single-binary CLI as a Debian archive.
 
 Usage:
-  package_deb.sh --binary PATH --name mot --version X.Y.Z --arch amd64 --out-dir dist --desc TEXT
+  package_deb.sh --binary PATH --name NAME --version X.Y.Z --arch amd64 --out-dir dist --desc TEXT --homepage URL
 EOF
 }
 
@@ -16,6 +16,9 @@ VERSION=""
 ARCH=""
 OUT_DIR=""
 DESC=""
+HOMEPAGE=""
+MAINTAINER="Daulet <noreply@github.com>"
+DEPENDS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -43,6 +46,18 @@ while [[ $# -gt 0 ]]; do
       DESC="$2"
       shift 2
       ;;
+    --homepage)
+      HOMEPAGE="$2"
+      shift 2
+      ;;
+    --maintainer)
+      MAINTAINER="$2"
+      shift 2
+      ;;
+    --depends)
+      DEPENDS="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -61,13 +76,26 @@ if [[ -z "${BINARY_PATH}" || -z "${PACKAGE_NAME}" || -z "${VERSION}" || -z "${AR
 fi
 
 if [[ -z "${DESC}" ]]; then
-  DESC="Fast CLI to aggregate LLM token usage from Codex and Claude Code metadata"
+  DESC="${PACKAGE_NAME} command line tool"
+fi
+
+if [[ -z "${HOMEPAGE}" ]]; then
+  HOMEPAGE="https://github.com/daulet/${PACKAGE_NAME}"
 fi
 
 if [[ ! -f "${BINARY_PATH}" ]]; then
   echo "binary not found: ${BINARY_PATH}" >&2
   exit 1
 fi
+
+case "${ARCH}" in
+  amd64 | arm64)
+    ;;
+  *)
+    echo "unsupported Debian architecture: ${ARCH}" >&2
+    exit 1
+    ;;
+esac
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
@@ -82,17 +110,24 @@ fi
 
 INSTALLED_SIZE="$(du -sk "${PKG_ROOT}/usr" | awk '{print $1}')"
 
-cat > "${PKG_ROOT}/DEBIAN/control" <<EOF
+{
+  cat <<EOF
 Package: ${PACKAGE_NAME}
 Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Maintainer: mot maintainers <noreply@github.com>
+Maintainer: ${MAINTAINER}
 Installed-Size: ${INSTALLED_SIZE}
-Homepage: https://github.com/daulet/mot
+EOF
+  if [[ -n "${DEPENDS}" ]]; then
+    echo "Depends: ${DEPENDS}"
+  fi
+  cat <<EOF
+Homepage: ${HOMEPAGE}
 Description: ${DESC}
 EOF
+} > "${PKG_ROOT}/DEBIAN/control"
 
 mkdir -p "${OUT_DIR}"
 dpkg-deb --build --root-owner-group "${PKG_ROOT}" "${OUT_DIR}/${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
