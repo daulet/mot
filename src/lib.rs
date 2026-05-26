@@ -548,7 +548,7 @@ pub fn collect_usage(options: &ScanOptions) -> UsageReport {
         (scan_all_codex(options), scan_all_claude(options))
     };
 
-    finalize_provider_pricing(&mut codex);
+    finalize_codex_pricing(&mut codex);
     finalize_provider_pricing(&mut claude);
 
     let mut report = UsageReport {
@@ -744,7 +744,7 @@ fn push_model_row(out: &mut String, provider: &str, model: &ModelReport) {
     out.push_str(&format!(
         "{:<10} {:<28} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14}\n",
         provider,
-        truncate_model_name(&model.model, 28),
+        truncate_model_name(&display_model_name(provider, &model.model), 28),
         format_u64(model.totals.input),
         format_u64(model.totals.output),
         format_u64(model.totals.thinking),
@@ -795,6 +795,10 @@ fn format_usd(value: f64) -> String {
 
 fn finalize_provider_pricing(report: &mut ProviderReport) {
     finalize_provider_pricing_with(report, lookup_model_pricing);
+}
+
+fn finalize_codex_pricing(report: &mut ProviderReport) {
+    finalize_provider_pricing_with(report, lookup_codex_model_pricing);
 }
 
 fn finalize_provider_pricing_with(
@@ -1219,14 +1223,20 @@ const fn pricing(
     }
 }
 
+const GPT_5_5_STANDARD_PRICING: ModelPricing = pricing(5.0, 30.0, 0.5, 5.0);
+
 // API standard-rate pricing snapshots used for estimation.
-// Source date: 2026-03-30.
+// Source date: 2026-05-26.
 // OpenAI: https://developers.openai.com/api/docs/pricing and
 // model pages under https://developers.openai.com/api/docs/models/*
 // Anthropic: https://docs.anthropic.com/en/docs/about-claude/pricing
 //
 // Anthropic cache write estimates use the default 5-minute cache write rate.
 const OPENAI_PRICING_RULES: &[PricingRule] = &[
+    PricingRule {
+        patterns: &["gpt-5.5"],
+        pricing: GPT_5_5_STANDARD_PRICING,
+    },
     PricingRule {
         patterns: &["gpt-5.4-pro"],
         pricing: pricing(30.0, 180.0, 0.0, 30.0),
@@ -1244,7 +1254,7 @@ const OPENAI_PRICING_RULES: &[PricingRule] = &[
         pricing: pricing(2.5, 15.0, 0.25, 2.5),
     },
     PricingRule {
-        patterns: &["gpt-5.3-codex"],
+        patterns: &["gpt-5.3-codex", "codex-auto-review"],
         pricing: pricing(1.75, 14.0, 0.175, 1.75),
     },
     PricingRule {
@@ -1373,8 +1383,28 @@ fn lookup_model_pricing(model: &str) -> Option<ModelPricing> {
     None
 }
 
+fn lookup_codex_model_pricing(model: &str) -> Option<ModelPricing> {
+    lookup_model_pricing(model)
+        .or_else(|| is_assumed_codex_alpha_model(model).then_some(GPT_5_5_STANDARD_PRICING))
+}
+
 fn should_exclude_unknown_model(model: &str) -> bool {
     lookup_model_pricing(model).is_none()
+}
+
+fn should_exclude_unknown_codex_model(model: &str) -> bool {
+    lookup_codex_model_pricing(model).is_none()
+}
+
+fn display_model_name(provider: &str, model: &str) -> String {
+    if provider == "Codex" && is_assumed_codex_alpha_model(model) {
+        return format!("{model} (assumed)");
+    }
+    model.to_string()
+}
+
+fn is_assumed_codex_alpha_model(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().ends_with("-alpha")
 }
 
 fn is_missing_model_metadata(model: &str) -> bool {
@@ -2109,7 +2139,7 @@ fn parse_codex_reader<R: BufRead>(
                                     .unwrap_or(UNKNOWN_MODEL)
                                     .to_string();
                                 if options.exclude_unknown_models
-                                    && should_exclude_unknown_model(&model)
+                                    && should_exclude_unknown_codex_model(&model)
                                 {
                                     continue;
                                 }
@@ -2926,6 +2956,36 @@ mod tests {
         assert!(rendered.contains("By model:"));
         assert!(rendered.contains("gpt-5.2-codex"));
         assert!(rendered.contains("claude-sonnet-4-5-20250929"));
+    }
+
+    #[test]
+    fn prices_current_codex_model_names_with_published_rates_and_labels_assumptions() {
+        let gpt_5_5 = lookup_model_pricing("gpt-5.5").expect("price gpt-5.5");
+        assert_eq!(gpt_5_5.input_per_mtok_usd, 5.0);
+        assert_eq!(gpt_5_5.output_per_mtok_usd, 30.0);
+        assert_eq!(gpt_5_5.cache_read_per_mtok_usd, 0.5);
+
+        let auto_review =
+            lookup_model_pricing("codex-auto-review").expect("price codex-auto-review");
+        assert_eq!(auto_review.input_per_mtok_usd, 1.75);
+        assert_eq!(auto_review.output_per_mtok_usd, 14.0);
+        assert_eq!(auto_review.cache_read_per_mtok_usd, 0.175);
+
+        for model in ["test-alpha"] {
+            let rates = lookup_codex_model_pricing(model).expect("price assumed alpha model");
+            assert_eq!(rates.input_per_mtok_usd, gpt_5_5.input_per_mtok_usd);
+            assert_eq!(rates.output_per_mtok_usd, gpt_5_5.output_per_mtok_usd);
+            assert_eq!(
+                rates.cache_read_per_mtok_usd,
+                gpt_5_5.cache_read_per_mtok_usd
+            );
+            assert_eq!(
+                display_model_name("Codex", model),
+                format!("{model} (assumed)")
+            );
+            assert_eq!(display_model_name("Claude", model), model);
+        }
+        assert!(lookup_model_pricing("future-alpha").is_none());
     }
 
     #[test]
