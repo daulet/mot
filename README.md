@@ -18,6 +18,11 @@ mot --all --since 1m # all sessions, only count tokens in past month
 mot --all --host vm-a --host vm-b # include remote VM sessions over SSH
 ```
 
+Models without a pricing rule are estimated at the `gpt-5.6-sol` baseline,
+using published GPT-5.5 standard rates: $5.00 input, $0.50 cached input, and
+$30.00 output per million tokens. Use `--exclude-unknown-models` to omit those
+records instead.
+
 Sample output:
 ```
 Scanned: codex 1440 files, claude 339 files in 273 ms

@@ -1224,15 +1224,22 @@ const fn pricing(
 }
 
 const GPT_5_5_STANDARD_PRICING: ModelPricing = pricing(5.0, 30.0, 0.5, 5.0);
+// GPT-5.6 SOL is a preview label without separately published API pricing.
+// Estimate it, and otherwise unknown models, at the published GPT-5.5 standard rate.
+const GPT_5_6_SOL_ESTIMATED_PRICING: ModelPricing = GPT_5_5_STANDARD_PRICING;
 
 // API standard-rate pricing snapshots used for estimation.
-// Source date: 2026-05-26.
+// Source date: 2026-07-09.
 // OpenAI: https://developers.openai.com/api/docs/pricing and
 // model pages under https://developers.openai.com/api/docs/models/*
 // Anthropic: https://docs.anthropic.com/en/docs/about-claude/pricing
 //
 // Anthropic cache write estimates use the default 5-minute cache write rate.
 const OPENAI_PRICING_RULES: &[PricingRule] = &[
+    PricingRule {
+        patterns: &["gpt-5.6-sol"],
+        pricing: GPT_5_6_SOL_ESTIMATED_PRICING,
+    },
     PricingRule {
         patterns: &["gpt-5.5"],
         pricing: GPT_5_5_STANDARD_PRICING,
@@ -1355,6 +1362,10 @@ const ANTHROPIC_PRICING_RULES: &[PricingRule] = &[
 ];
 
 fn lookup_model_pricing(model: &str) -> Option<ModelPricing> {
+    Some(lookup_known_model_pricing(model).unwrap_or(GPT_5_6_SOL_ESTIMATED_PRICING))
+}
+
+fn lookup_known_model_pricing(model: &str) -> Option<ModelPricing> {
     let normalized = model.trim().to_ascii_lowercase();
     if normalized.is_empty() || normalized == UNKNOWN_MODEL {
         return None;
@@ -1384,16 +1395,20 @@ fn lookup_model_pricing(model: &str) -> Option<ModelPricing> {
 }
 
 fn lookup_codex_model_pricing(model: &str) -> Option<ModelPricing> {
-    lookup_model_pricing(model)
+    Some(lookup_known_codex_model_pricing(model).unwrap_or(GPT_5_6_SOL_ESTIMATED_PRICING))
+}
+
+fn lookup_known_codex_model_pricing(model: &str) -> Option<ModelPricing> {
+    lookup_known_model_pricing(model)
         .or_else(|| is_assumed_codex_alpha_model(model).then_some(GPT_5_5_STANDARD_PRICING))
 }
 
 fn should_exclude_unknown_model(model: &str) -> bool {
-    lookup_model_pricing(model).is_none()
+    lookup_known_model_pricing(model).is_none()
 }
 
 fn should_exclude_unknown_codex_model(model: &str) -> bool {
-    lookup_codex_model_pricing(model).is_none()
+    lookup_known_codex_model_pricing(model).is_none()
 }
 
 fn display_model_name(provider: &str, model: &str) -> String {
@@ -2971,21 +2986,21 @@ mod tests {
         assert_eq!(auto_review.output_per_mtok_usd, 14.0);
         assert_eq!(auto_review.cache_read_per_mtok_usd, 0.175);
 
-        for model in ["test-alpha"] {
-            let rates = lookup_codex_model_pricing(model).expect("price assumed alpha model");
-            assert_eq!(rates.input_per_mtok_usd, gpt_5_5.input_per_mtok_usd);
-            assert_eq!(rates.output_per_mtok_usd, gpt_5_5.output_per_mtok_usd);
-            assert_eq!(
-                rates.cache_read_per_mtok_usd,
-                gpt_5_5.cache_read_per_mtok_usd
-            );
-            assert_eq!(
-                display_model_name("Codex", model),
-                format!("{model} (assumed)")
-            );
-            assert_eq!(display_model_name("Claude", model), model);
-        }
-        assert!(lookup_model_pricing("future-alpha").is_none());
+        let model = "test-alpha";
+        let rates = lookup_codex_model_pricing(model).expect("price assumed alpha model");
+        assert_eq!(rates.input_per_mtok_usd, gpt_5_5.input_per_mtok_usd);
+        assert_eq!(rates.output_per_mtok_usd, gpt_5_5.output_per_mtok_usd);
+        assert_eq!(
+            rates.cache_read_per_mtok_usd,
+            gpt_5_5.cache_read_per_mtok_usd
+        );
+        assert_eq!(
+            display_model_name("Codex", model),
+            format!("{model} (assumed)")
+        );
+        assert_eq!(display_model_name("Claude", model), model);
+        assert!(lookup_known_model_pricing("future-alpha").is_none());
+        assert!(lookup_known_codex_model_pricing("future-alpha").is_some());
     }
 
     #[test]
@@ -3228,7 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_models_are_tracked_as_unpriced() {
+    fn unknown_models_use_gpt_5_6_sol_estimated_pricing() {
         let temp = tempdir().expect("create tempdir");
         let codex_root = temp.path().join("codex");
         fs::create_dir_all(&codex_root).expect("create codex root");
@@ -3257,15 +3272,55 @@ mod tests {
         };
 
         let report = collect_usage(&options);
-        assert_eq!(report.estimated_cost_usd, 0.0);
-        assert_eq!(report.unpriced_totals.input, 7);
-        assert_eq!(report.unpriced_totals.cache_read, 3);
-        assert_eq!(report.unpriced_totals.output, 1);
-        assert!(
-            report
-                .unpriced_models
-                .contains(&"mystery-model".to_string())
+        let expected_cost = (7.0 * 5.0 + 3.0 * 0.5 + 1.0 * 30.0 + 1.0 * 30.0) / 1_000_000.0;
+        assert!((report.estimated_cost_usd - expected_cost).abs() < 1e-12);
+        assert_eq!(report.priced_totals.input, 7);
+        assert_eq!(report.priced_totals.cache_read, 3);
+        assert_eq!(report.priced_totals.output, 1);
+        assert_eq!(report.priced_totals.thinking, 1);
+        assert!(report.unpriced_totals.is_zero());
+        assert!(report.unpriced_models.is_empty());
+
+        let model = report
+            .codex
+            .by_model
+            .iter()
+            .find(|entry| entry.model == "mystery-model")
+            .expect("mystery model report");
+        let pricing = model.pricing.expect("fallback pricing");
+        assert_eq!(pricing.input_per_mtok_usd, 5.0);
+        assert_eq!(pricing.cache_read_per_mtok_usd, 0.5);
+        assert_eq!(pricing.output_per_mtok_usd, 30.0);
+    }
+
+    #[test]
+    fn strict_unknown_check_remains_separate_from_fallback_pricing() {
+        assert!(lookup_known_model_pricing("mystery-model").is_none());
+        assert!(should_exclude_unknown_model("mystery-model"));
+        assert!(should_exclude_unknown_codex_model("mystery-model"));
+
+        let sol = lookup_known_model_pricing("gpt-5.6-sol").expect("5.6 SOL pricing");
+        let fallback = lookup_model_pricing("mystery-model").expect("fallback pricing");
+        assert_eq!(fallback.input_per_mtok_usd, sol.input_per_mtok_usd);
+        assert_eq!(fallback.output_per_mtok_usd, sol.output_per_mtok_usd);
+        assert_eq!(
+            fallback.cache_read_per_mtok_usd,
+            sol.cache_read_per_mtok_usd
         );
+        assert_eq!(
+            fallback.cache_write_per_mtok_usd,
+            sol.cache_write_per_mtok_usd
+        );
+
+        let missing = lookup_model_pricing(UNKNOWN_MODEL).expect("missing-model fallback pricing");
+        assert_eq!(missing.input_per_mtok_usd, sol.input_per_mtok_usd);
+        assert!(should_exclude_unknown_model(UNKNOWN_MODEL));
+        assert!(should_exclude_unknown_codex_model(UNKNOWN_MODEL));
+
+        let alpha =
+            lookup_known_codex_model_pricing("future-alpha").expect("assumed Codex alpha pricing");
+        assert_eq!(alpha.input_per_mtok_usd, sol.input_per_mtok_usd);
+        assert!(!should_exclude_unknown_codex_model("future-alpha"));
     }
 
     #[test]
